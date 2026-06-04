@@ -1,0 +1,116 @@
+# GLM-MoE-DSA family — class catalog (DeepSeek-V3.2-style MLA + sparse-attention MoE LLMs).
+#
+# Covers GLM-5.1 FP8 (``GlmMoeDsaForCausalLM``) — a thin subclass of
+# DeepSeek's ``DeepseekV2ForCausalLM`` (vLLM 0.21 reuses the same
+# implementation file, ``deepseek_v2.py``). GLM-5.1's HF config sets
+# ``model_type: glm_moe_dsa``; this catalog also covers any other model
+# that maps to the same registry entry (DeepSeek-V3.2 itself, future
+# DSA variants).
+#
+# Architecture summary:
+#   - Multi-head Latent Attention (MLA) with LoRA decomposition
+#     (``fused_qkv_a_proj`` → ``q_a_layernorm`` → ``q_b_proj`` →
+#      ``kv_a_layernorm`` → ``rotary_emb`` → ``indexer`` → ``MLAAttention``
+#      → ``o_proj``). All sub-modules live under
+#     ``MultiHeadLatentAttentionWrapper.forward``.
+#   - DeepSeek Sparse Attention (DSA) v3.2: a per-layer ``Indexer`` block
+#     computes top-K key selection before the attention kernel. v1 of
+#     this yaml absorbs the indexer time into a single ``dense`` catalog
+#     entry — it scales mostly with token count, so dense lookup keyed
+#     on ``tokens`` is a reasonable first-order model. KV-length
+#     dependence is not yet captured (will overcount on long contexts;
+#     revisit with a dedicated ``indexer`` category if needed).
+#   - MoE: first ``first_k_dense_replace`` decoder layers use the plain
+#     ``DeepseekV2MLP``; the rest use ``DeepseekV2MoE``, whose
+#     ``self.experts`` is a ``FusedMoE`` that internally calls the router
+#     (``GateLinear``) plus shared experts plus the routed-experts
+#     kernel. We profile the whole ``FusedMoE.forward`` as one shot.
+#   - Two RMSNorms inside ``MultiHeadLatentAttentionWrapper`` share
+#     classname + parent (``q_a_layernorm`` and ``kv_a_layernorm``); the
+#     yaml schema requires unique ``(vllm, within)`` pairs, so they
+#     collapse into one canonical entry ``mla_lora_layernorm`` whose
+#     measured time covers both calls per layer (mirrors qwen3's
+#     unified ``layernorm`` entry for input + post_attn).
+#
+# Profiling note: ``HOST_ENGINE_DEFAULTS["hf_overrides"]`` forces
+# ``num_hidden_layers=1``. With GLM-5.1's ``first_k_dense_replace=3``,
+# the single profiled layer is a dense layer — so ``moe.csv`` will not
+# be populated unless the CLI overrides
+# ``--hf-overrides='{"first_k_dense_replace": 0}'`` to make layer-0
+# behave as MoE for the MoE category sweep.
+#
+# Canonical layer names mirror vLLM's attribute names (see
+# ../vllm/vllm/model_executor/models/deepseek_v2.py and
+# ../vllm/vllm/model_executor/layers/mla.py).
+#
+# ``sequence:`` describes the ordered pipeline the simulator's
+# trace_generator walks to emit one iteration. TP ALLREDUCE (after
+# ``o_proj`` / ``down_proj``) and EP ALLTOALL (around ``moe``) are
+# attached by the simulator from cluster config and need not be listed
+# here.
+
+
+sequence:
+  prologue:  [embedding]
+  pre_attn:  [layernorm, fused_qkv_a_proj, mla_lora_layernorm, q_b_proj, rotary_emb, indexer, attention]
+  post_attn: [o_proj, layernorm]
+  mlp_dense: [gate_up_proj, act_fn, down_proj]
+  mlp_moe:   [moe]
+  head:      [final_layernorm, lm_head, sampler]
+
+
+catalog:
+  dense:
+    embedding:
+      vllm: VocabParallelEmbedding
+    layernorm:
+      vllm: RMSNorm
+      within: DeepseekV2DecoderLayer
+      tp_stable: true
+    fused_qkv_a_proj:
+      vllm: DeepSeekV2FusedQkvAProjLinear
+      within: MultiHeadLatentAttentionWrapper
+    mla_lora_layernorm:
+      vllm: RMSNorm
+      within: MultiHeadLatentAttentionWrapper
+      tp_stable: true
+    q_b_proj:
+      vllm: ColumnParallelLinear
+      within: MultiHeadLatentAttentionWrapper
+    kv_b_proj:
+      vllm: ColumnParallelLinear
+      within: MLAAttention
+    rotary_emb:
+      vllm: RotaryEmbedding
+      within: MultiHeadLatentAttentionWrapper
+    indexer:
+      vllm: Indexer
+      within: MultiHeadLatentAttentionWrapper
+    o_proj:
+      vllm: RowParallelLinear
+      within: MultiHeadLatentAttentionWrapper
+    gate_up_proj:
+      vllm: MergedColumnParallelLinear
+      within: DeepseekV2MLP
+    act_fn:
+      vllm: SiluAndMul
+      within: DeepseekV2MLP
+    down_proj:
+      vllm: RowParallelLinear
+      within: DeepseekV2MLP
+    final_layernorm:
+      vllm: RMSNorm
+      within: DeepseekV2Model
+      tp_stable: true
+  per_sequence:
+    lm_head:
+      vllm: LogitsProcessor
+    sampler:
+      vllm: Sampler
+      tp_stable: true
+  attention:
+    attention:
+      vllm: MLAAttention
+  moe:
+    moe:
+      vllm: FusedMoE
