@@ -962,7 +962,9 @@ def _emit_layer(ctx, bctx, layer_name, lines, power_acc, batch_tag='NONE', layer
         if wt_loc != 'LOCAL':
             power_acc.dram_weight_bytes += wt
         if comm_size > 0:
-            power_acc.link_data_bytes += total_ring_data(comm_size, ctx.tp_size, collective=comm_type.lower())
+            # comm_type may carry ":dim0,dim1" involved_dim suffix for DP topologies;
+            # strip it before matching against the power model's collective table.
+            power_acc.link_data_bytes += total_ring_data(comm_size, ctx.tp_size, collective=comm_type.split(':')[0].lower())
 
     return latency_ns
 
@@ -1180,12 +1182,57 @@ def _emit_pre_attn_layers(ctx, bctx, layer_num, lines, power_acc, batch_tag='NON
                    lines, power_acc, batch_tag)
 
 
+def _is_moe_layer(config, layer_num):
+    """Return True if decoder layer ``layer_num`` uses a MoE FFN.
+
+    DeepSeek/GLM-style models run a dense FFN in the first
+    ``first_k_dense_replace`` decoder layers, then a MoE block every
+    ``moe_layer_freq`` layers afterwards (both default to GLM-5.1's values
+    of 3 and 1). Models without these keys are uniform: every layer that
+    has a gate is MoE.
+    """
+    first_k = config.get('first_k_dense_replace', 0) or 0
+    if layer_num < first_k:
+        return False
+    freq = config.get('moe_layer_freq', 1) or 1
+    if freq <= 1:
+        return True
+    return (layer_num % freq) == 0
+
+
+def _layer_segments(config, num_layers, is_moe):
+    """Partition ``[0, num_layers)`` into block-copy segments.
+
+    Each segment is ``(representative_layer_num, count)``. For uniform
+    models (no gate, or ``first_k_dense_replace == 0`` with
+    ``moe_layer_freq <= 1``) this returns a single segment so block-copy
+    behaves exactly as before. GLM/DeepSeek with a leading dense run
+    yields a dense segment followed by a MoE segment. When MoE placement
+    is non-contiguous (``moe_layer_freq > 1``) we fall back to one
+    segment per layer so the per-layer dense/MoE decision is honored
+    (block-copy is disabled for that case).
+    """
+    if not is_moe:
+        return [(0, num_layers)]
+    first_k = max(0, min(config.get('first_k_dense_replace', 0) or 0, num_layers))
+    freq = config.get('moe_layer_freq', 1) or 1
+    if freq > 1:
+        return [(i, 1) for i in range(num_layers)]
+    segments = []
+    if first_k > 0:
+        segments.append((0, first_k))
+    if num_layers - first_k > 0:
+        segments.append((first_k, num_layers - first_k))
+    return segments or [(0, num_layers)]
+
+
 def _emit_post_attn_layers(ctx, bctx, layer_num, lines, power_acc, batch_id_str, batch_tag='NONE'):
     # Attention post-processing common to dense and MoE.
     _emit_sequence(ctx, bctx, layer_num, _sequence(ctx.perf_db, "post_attn"),
                    lines, power_acc, batch_tag)
-    # MLP: either the dense FFN stack or a single MoE block.
-    if ctx.is_moe:
+    # MLP: either the dense FFN stack or a single MoE block. With
+    # first_k_dense_replace the choice is per-layer, not global.
+    if ctx.is_moe and _is_moe_layer(ctx.config, layer_num):
         moe_seq = _sequence(ctx.perf_db, "mlp_moe")
         for layer_name in moe_seq:
             if layer_name == "moe":
@@ -1315,23 +1362,32 @@ def _synthesize_trace(hardware, model, config, tp_size, pp_size, local_ep, ep_to
 
         # Transformer blocks
         num_layers = config['num_hidden_layers']
-        iter_count, copy_count = (num_layers, 1) if block_mode_on else (1, num_layers)
 
-        for layer_num in range(iter_count):
-            block_lines, block_power = _build_transformer_block(ctx, bctx, layer_num, 'NONE', str(batch.batch_id))
-
-            # MoE blocks are only safely replayable when the router
-            # opts into block copy (BALANCED is deterministic; others
-            # carry tiny per-layer variance that block_copy swallows
-            # for the sake of trace-generation speed).
-            can_copy = (not ctx.is_moe or ctx.gate.block_copy) and not block_mode_on
-            if can_copy:
-                for _ in range(copy_count):
-                    f.writelines(block_lines)
-                    block_power.flush(ctx, enable_attn_offloading)
-            else:
+        if block_mode_on:
+            # Emit every layer individually; the per-layer dense/MoE
+            # decision lives in _emit_post_attn_layers.
+            for layer_num in range(num_layers):
+                block_lines, block_power = _build_transformer_block(
+                    ctx, bctx, layer_num, 'NONE', str(batch.batch_id))
                 f.writelines(block_lines)
                 block_power.flush(ctx, enable_attn_offloading)
+        else:
+            # Block-copy mode: build one representative block per segment
+            # (dense run then MoE run for first_k_dense_replace models) and
+            # replicate it. MoE blocks are only safely replayable when the
+            # router opts into block copy (BALANCED is deterministic; others
+            # carry tiny per-layer variance that block_copy swallows for the
+            # sake of trace-generation speed) — non-block-copy MoE collapses
+            # the segment to a single emitted block, as before.
+            for rep_layer, count in _layer_segments(config, num_layers, ctx.is_moe):
+                block_lines, block_power = _build_transformer_block(
+                    ctx, bctx, rep_layer, 'NONE', str(batch.batch_id))
+                seg_is_moe = ctx.is_moe and _is_moe_layer(config, rep_layer)
+                can_copy = (not seg_is_moe or ctx.gate.block_copy)
+                emit_count = count if can_copy else 1
+                for _ in range(emit_count):
+                    f.writelines(block_lines)
+                    block_power.flush(ctx, enable_attn_offloading)
 
         # Final layers
         _emit_final_layers(ctx, bctx, f)
@@ -1391,32 +1447,39 @@ def _synthesize_interleaved_trace(hardware, model, config, tp_size, pp_size, loc
         f.writelines(pre_attn2_lines)
         pre_attn2_power.flush(ctx, enable_attn_offloading)
 
-        # MIDDLE LAYERS: interleaved post_attn + pre_attn
+        # MIDDLE LAYERS: interleaved post_attn + pre_attn.
+        # The interleaved block at index i emits post_attn(i) (where the
+        # dense/MoE MLP lives) + pre_attn(i+1) (uniform). The pre_attn
+        # representative is irrelevant to the dense/MoE split, so the same
+        # first_k_dense_replace segmentation as the simple path applies over
+        # the middle range [0, middle_layers).
         middle_layers = num_layers - 1
-        iter_count, copy_count = (middle_layers, 1) if block_mode_on else (1, middle_layers)
 
-        for layer_num in range(iter_count):
+        if block_mode_on:
+            middle_segments = [(i, 1) for i in range(middle_layers)]
+        else:
+            middle_segments = _layer_segments(config, middle_layers, ctx.is_moe)
+
+        for rep_layer, count in middle_segments:
             block_lines = []
             block_power = PowerAccumulator([], [], 0, 0)
 
             # Batch1: post_attn(current) + pre_attn(next)
-            _emit_post_attn_layers(ctx, bctx1, layer_num, block_lines, block_power, f"{batches[0].batch_id}.0", 'BATCH_1')
-            _emit_pre_attn_layers(ctx, bctx1, layer_num + 1, block_lines, block_power, 'BATCH_1')
+            _emit_post_attn_layers(ctx, bctx1, rep_layer, block_lines, block_power, f"{batches[0].batch_id}.0", 'BATCH_1')
+            _emit_pre_attn_layers(ctx, bctx1, rep_layer + 1, block_lines, block_power, 'BATCH_1')
 
             # Batch2: post_attn(current) + pre_attn(next)
-            _emit_post_attn_layers(ctx, bctx2, layer_num, block_lines, block_power, f"{batches[1].batch_id}.1", 'BATCH_2')
-            _emit_pre_attn_layers(ctx, bctx2, layer_num + 1, block_lines, block_power, 'BATCH_2')
+            _emit_post_attn_layers(ctx, bctx2, rep_layer, block_lines, block_power, f"{batches[1].batch_id}.1", 'BATCH_2')
+            _emit_pre_attn_layers(ctx, bctx2, rep_layer + 1, block_lines, block_power, 'BATCH_2')
 
-            # MoE blocks are only safely replayable when the router
-            # opts into block copy (BALANCED is deterministic; others
-            # carry tiny per-layer variance that block_copy swallows
-            # for the sake of trace-generation speed).
-            can_copy = (not ctx.is_moe or ctx.gate.block_copy) and not block_mode_on
-            if can_copy:
-                for _ in range(copy_count):
-                    f.writelines(block_lines)
-                    block_power.flush(ctx, enable_attn_offloading)
-            else:
+            # MoE blocks are only safely replayable when the router opts into
+            # block copy (BALANCED is deterministic; others carry tiny
+            # per-layer variance that block_copy swallows for the sake of
+            # trace-generation speed).
+            seg_is_moe = ctx.is_moe and _is_moe_layer(config, rep_layer)
+            can_copy = (not seg_is_moe or ctx.gate.block_copy) and not block_mode_on
+            emit_count = count if can_copy else 1
+            for _ in range(emit_count):
                 f.writelines(block_lines)
                 block_power.flush(ctx, enable_attn_offloading)
 
@@ -1463,10 +1526,13 @@ def generate_trace(batch, hardware, tp_size, pp_size, local_ep, ep_total, pd_typ
     output_path = f"inputs/trace/{hardware}/{batch.model}/instance{instance_id}_batch{batch.batch_id}.txt"
     os.makedirs(os.path.dirname(output_path), exist_ok=True)
 
-    # make trace — accept either the Mistral-style ``num_local_experts``
-    # key or the HF/Qwen3 ``num_experts`` key so both family's configs
-    # resolve to a live GateRouter.
-    num_experts_cfg = config.get("num_local_experts", config.get("num_experts"))
+    # make trace — accept the Mistral-style ``num_local_experts`` key,
+    # the HF/Qwen3 ``num_experts`` key, or the DeepSeek/GLM
+    # ``n_routed_experts`` key so every family's config resolves to a
+    # live GateRouter.
+    num_experts_cfg = config.get(
+        "num_local_experts",
+        config.get("num_experts", config.get("n_routed_experts")))
     if num_experts_cfg:
         gate = GateRouter(
             node_id, instance_id, num_experts_cfg,
