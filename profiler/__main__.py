@@ -39,11 +39,13 @@ Verbosity
 from __future__ import annotations
 
 import argparse
+import json
 import logging
 import os
 import shutil
 import sys
 from pathlib import Path
+from typing import Any
 
 from profiler.core import logger as log
 from profiler.core.config import (
@@ -109,6 +111,12 @@ def _add_common_flags(p: argparse.ArgumentParser) -> None:
                    dest="max_num_seqs",
                    help="Max concurrent sequences. Matches vLLM's own "
                         "``--max-num-seqs``. Default: 256.")
+    p.add_argument("--hf-overrides", default=None, dest="hf_overrides",
+                   help="JSON string of HF config overrides merged on top "
+                        "of profiler defaults (num_hidden_layers=1) and "
+                        "under TP sharding. Example: profile a GLM-5.1 MoE "
+                        "layer instead of the default dense layer: "
+                        "--hf-overrides '{\"first_k_dense_replace\":0}'.")
 
     # Attention grid.
     p.add_argument("--attention-max-kv", type=int, default=16384,
@@ -305,6 +313,22 @@ def _parse_tp(tp_str: str) -> list[int]:
     return tps
 
 
+def _parse_hf_overrides(raw: str | None) -> dict[str, Any] | None:
+    if raw is None:
+        return None
+    try:
+        parsed = json.loads(raw)
+    except json.JSONDecodeError as e:
+        raise ValueError(
+            f"--hf-overrides must be a valid JSON object, got {raw!r}: {e}"
+        ) from e
+    if not isinstance(parsed, dict):
+        raise ValueError(
+            f"--hf-overrides must decode to a JSON object, got {type(parsed).__name__}"
+        )
+    return parsed
+
+
 def _build_profile_args(
     ns: argparse.Namespace,
     hf_id: str,
@@ -332,7 +356,7 @@ def _build_profile_args(
         skew_kvs_factor=getattr(ns, "skew_kvs_factor", 2.0),
         only_skew=getattr(ns, "only_skew", False),
         force=getattr(ns, "force", False),
-        hf_overrides=None,
+        hf_overrides=_parse_hf_overrides(getattr(ns, "hf_overrides", None)),
         model_config=model_config,
     )
 

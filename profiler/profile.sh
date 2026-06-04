@@ -48,6 +48,15 @@ TP_DEGREES="1,2"
 MAX_NUM_BATCHED_TOKENS=2048      # vLLM's --max-num-batched-tokens
 MAX_NUM_SEQS=256                 # vLLM's --max-num-seqs
 
+# Extra HF config overrides merged on top of the profiler's default
+# (num_hidden_layers=1) and under TP sharding. Must be a JSON object.
+# Use this when the model's first profiled layer doesn't reach the
+# code path you want to measure. Example: GLM-5.1 / DeepSeek-V3.2 set
+# first_k_dense_replace=3, so the single profiled layer is dense and
+# moe.csv stays empty; force layer 0 to be MoE by setting
+# first_k_dense_replace=0.
+# HF_OVERRIDES='{"first_k_dense_replace":0}'
+
 # --- Attention grid ---------------------------------------------------------
 # Upper bound for kv_prefill / kv_decode axes. The grid grows
 # geometrically from 512 up to min(this, max_model_len).
@@ -119,6 +128,7 @@ cmd=(python3 -m profiler profile "$MODEL" --hardware "$HARDWARE")
 [[ -n "${KV_CACHE_DTYPE:-}" ]]         && cmd+=(--kv-cache-dtype "$KV_CACHE_DTYPE")
 [[ -n "${MAX_NUM_BATCHED_TOKENS:-}" ]] && cmd+=(--max-num-batched-tokens "$MAX_NUM_BATCHED_TOKENS")
 [[ -n "${MAX_NUM_SEQS:-}" ]]           && cmd+=(--max-num-seqs "$MAX_NUM_SEQS")
+[[ -n "${HF_OVERRIDES:-}" ]]           && cmd+=(--hf-overrides "$HF_OVERRIDES")
 [[ -n "${ATTENTION_MAX_KV:-}" ]]       && cmd+=(--attention-max-kv "$ATTENTION_MAX_KV")
 [[ -n "${ATTENTION_CHUNK_FACTOR:-}" ]] && cmd+=(--attention-chunk-factor "$ATTENTION_CHUNK_FACTOR")
 [[ -n "${ATTENTION_KV_FACTOR:-}" ]]    && cmd+=(--attention-kv-factor "$ATTENTION_KV_FACTOR")
