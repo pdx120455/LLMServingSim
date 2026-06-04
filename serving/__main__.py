@@ -171,11 +171,18 @@ def main():
     _dtype_to_bits = {'float16': 16, 'bfloat16': 16, 'float32': 32, 'fp8': 8, 'int8': 8}
     dtype = args.dtype
     if dtype is None:
-        # Peek at cluster config to pick the default model's torch_dtype
-        with open(args.cluster_config, 'r') as _f:
+        # Peek at cluster config to pick the default model's torch_dtype.
+        # cwd is already astra-sim/, so prepend '../' like build_cluster_config.
+        with open(f'../{args.cluster_config}', 'r') as _f:
             _cluster_peek = json.load(_f)
         _first_model = None
-        for _inst in _cluster_peek.get('instances', []):
+        # Instances live under nodes[].instances[] (top-level 'instances' is
+        # only the post-parse flattened form, absent in the raw config file).
+        _peek_instances = _cluster_peek.get('instances', [])
+        if not _peek_instances:
+            for _node in _cluster_peek.get('nodes', []):
+                _peek_instances.extend(_node.get('instances', []))
+        for _inst in _peek_instances:
             if _inst.get('model_name'):
                 _first_model = _inst['model_name']
                 break
