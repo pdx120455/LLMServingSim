@@ -68,7 +68,7 @@ model_type: "glm_moe_dsa"                    → 需要 profiler/models/glm_moe_
 | 2.5 | 修 attention 查表：MLA 的 cost 跟 `kv_lora_rank` 相关，需要在 lookup key 里加新维度，或在 yaml 中额外标注 | `serving/core/trace_generator.py::_lookup_attention*` | P1 | ⏳ 待 H20 profile（attention.csv 4D grid 当前对 MLA 直接复用，量级偏差待真实数据回归后再决定是否扩 5D） |
 | 2.6 | sparse attn cost 模型：超过 `index_topk` 后 cost 平坦化 | `serving/core/trace_generator.py` | P1 | ⏳ 待 H20 profile（与 2.5 同批处理） |
 | 2.7 | ~~shared expert 加进 MoE cost~~ | `serving/core/trace_generator.py` | ~~P0~~ | ❌ 2026-06-04 撤销：源码 + trace 证实 shared expert 在 `FusedMoE.forward` **内部**计算（见决策日志），moe.csv 已含其时间，simulator 无需单独 emit（否则双计）。剩 H20-time profiler 校验：确认强制路由 patch 未 bypass shared kernel |
-| 2.8 | `noaux_tc` 路由的 EP token 分布写一个 `ROUTING_POLICY=NOAUX_TC` 实现 | `serving/core/gate_function.py` | P2 | ⏳ 延后（一阶用 BALANCED/RR 近似） |
+| 2.8 | ~~`noaux_tc` 路由实现~~ → **重定义为 group-limited routing**（`n_group`/`topk_group` 掩码 + EP-to-group 对齐）。GLM-5.1 `n_group=1` 用不上，仅 DeepSeek-V3 家族（`n_group=8, topk_group=4`）受益 | `serving/core/gate_function.py::route_ep` | P3（GLM-5.1 无需） | ⏳ 延后。GLM-5.1 用 `BALANCED` 已是物理合理近似（见决策日志 2026-06-04 noaux_tc 条） |
 | 2.9 | cluster config 样例 | `configs/cluster/` | P1 | ✅ 2026-06-04（三档齐：`single_node_glm51_smoke.json` tp=1 / `single_node_glm51_tp2_ep2.json` tp=2 ep=2 / `h20_8_glm5_1_fp8.json` tp=8 ep=8 8 卡。H20 模板 bw/latency/mem_bw 为占位待实测；config_builder 解析通过 (8=tp8·pp1, ep8)） |
 
 ### Phase 3 - validation（P0，1 周）
@@ -83,7 +83,7 @@ model_type: "glm_moe_dsa"                    → 需要 profiler/models/glm_moe_
 
 | # | 任务 | 优先级 |
 |---|---|---|
-| 4.1 | LLMServingSim 仓库开 issue 描述 GLM-5.1 / DeepSeek-V3.2 架构支持需求，附本文档 | P1 |
+| 4.1 | LLMServingSim 仓库开 issue 描述 GLM-5.1 / DeepSeek-V3.2 架构支持需求，附本文档 | ✅ 2026-06-04 草稿完成（`GLM5_1_UPSTREAM_ISSUE_DRAFT.md`，英文，含架构差异 / 提议改动 / 3 个模型无关 bug / 已原型化清单 / 4 个待维护者确认的开放问题；**未发布**，待人工 review 后粘贴到 casys-kaist/LLMServingSim issues） |
 | 4.2 | PR 分两个：(a) profiler 侧 yaml + categories.py 改动，(b) simulator 侧 memory_model + trace_generator 改动 | P1 |
 | 4.3 | 写 docs/ 下的支持说明（MLA / DSA 是 vanilla 之外的第一个非标架构） | P2 |
 
@@ -121,7 +121,7 @@ model_type: "glm_moe_dsa"                    → 需要 profiler/models/glm_moe_
 - [ ] H20 服务器 conda 环境：vLLM >= 0.21.0（验证 `GlmMoeDsaForCausalLM` 在 registry）
 - [ ] H20 服务器 CUDA >= 12.4（FP8 + MLA 需要）
 - [ ] LLMServingSim 仓库（当前 branch `main`，commit `a385673`）
-- [ ] ASTRA-Sim + Chakra 已编译
+- [x] ASTRA-Sim + Chakra 已编译（2026-06-04 本机原生编译，`AnalyticalAstra` 二进制可用；chakra 经符号链接装进 vllm_020）
 
 ### 数据
 - [ ] GLM-5.1 模型权重已下载（路径：需 H20 上确认；本机有 `/home/luoliang/workspace/glm5.1/`）
@@ -137,6 +137,20 @@ model_type: "glm_moe_dsa"                    → 需要 profiler/models/glm_moe_
 ---
 
 ## 6. 当前已完成 / 阻塞中
+
+### 6.0 完成度统计（2026-06-05 核对）
+
+全部 22 个任务（Phase 1-4，权威任务表见 §3）：
+
+| 状态 | 数 | 任务 |
+|---|---|---|
+| ✅ 完成 | 8 | 1.1 / 1.6 / 2.1 / 2.2 / 2.3 / 2.4 / 2.9 / 4.1(草稿) |
+| ❌ 撤销(已决) | 2 | 1.2 SHARD_FIELDS / 2.7 shared expert |
+| ⬇ 降 P3(GLM 无需) | 1 | 2.8 group-limited routing |
+| ⏳ 阻塞 H20 | 9 | 1.3/1.4/1.5/1.7 · 2.5/2.6 · 3.1/3.2/3.3 |
+| ◻ 对外/未起 | 2 | 4.2 PR / 4.3 docs |
+
+**不依赖 GPU 的本地工作已 100% 完成**，全部 GLM 代码已提交（`af02f81` / `4c35d6d` / `5e3d18b` / `1fbbb1c`），三份文档交付物 2026-06-05 提交。剩余全为 H20 数据（按 `H20_RUNBOOK.md` 执行）+ 对外动作。
 
 ### 已完成（2026-05-28）
 - ✅ Qwen3-0.6B profile 在 vllm_020 + 5060Ti 上跑通（小规模快速验证，缩水 attention grid + skip skew）
@@ -159,13 +173,22 @@ model_type: "glm_moe_dsa"                    → 需要 profiler/models/glm_moe_
 - ✅ Phase 2.2 完成：`first_k_dense_replace` 逐层 dense/MoE 切分（trace_generator `_is_moe_layer`/`_layer_segments` + block-copy/interleaved 分段复制；memory_model `get_weight` 按段累加）。dry-run 全部边界通过（详见任务表 2.2 行）
 - ✅ config_builder MoE 检测补 `n_routed_experts` fallback（`config_builder.py:35` + 88）：GLM 不写 ep_size 时自动推断 `ep_size=tp_size=8`、ep-divides-256 校验生效（实测 ep=3 被拒）。与 trace_generator:1469 / memory_model.is_moe 三处一致
 - ✅ `configs/model/zai-org/GLM-5.1.json` HF config 子集
+- ✅ Phase 2.x（router / scheduler / agentic 兼容）dry-run 验证：standalone driver（无 ASTRA-Sim 子进程）驱动真实 Router+Scheduler+MemoryModel，19/19 check 通过。① `get_weight` first_k 分段精确（split == 1·dense_block + 3·moe_block，moe 20.6GB/层 ≫ dense 1.76GB/层 @ ep=1 tp=1）；② MLA KV 不随 TP 切（tp1==tp2==4608 B/token = 576·4层·2B）；③ agentic 依赖链：2 flat + 2 session(3+2 sub)=7 请求在 prefix-caching 开/关两种模式下全部 `add_done` 完成、`is_free()` 无泄漏。Router 模型无关无 GLM 特定逻辑。仅 mock ASTRA-Sim cycle 反馈 + 跳过 trace/graph（已单独验证）
 - ✅ trace_generator 端到端 Python 链路验证：单层 16-layer trace / 2-layer override 28-layer trace 含 MoE 块；1D 拓扑产 ALLREDUCE + ALLGATHER+REDUCESCATTER；2D DP 拓扑产 `:1,0` 后缀
 - ✅ 期间修两个 simulator bug：
   - `trace_generator.py:1469` MoE 检测加 `n_routed_experts` fallback（之前 DeepSeek/GLM family 不会激活 MoE 路径）
   - `trace_generator.py:965` `comm_type.split(':')[0].lower()` 剥 dim 后缀（DP 拓扑 + power_model 之前从未走通）
+- ✅ **ASTRA-Sim 子进程端到端跑通（原生编译，非 docker）**：docker registry 拉取始终被阻塞（daemon 无代理、需 root），改走**原生编译**。已编出 `AnalyticalAstra` 二进制并跑通两档 GLM-5.1 smoke：
+  - tp=1 (`single_node_glm51_smoke.json`)：2 请求全栈跑通（serving → chakra converter → AnalyticalAstra → cycle 反馈），CSV 2 行、latency 全正、`All Request Has Been Exited` 干净退出
+  - tp=2 ep=2 (`single_node_glm51_tp2_ep2.json`)：2 请求干净退出，**348 个 ALLREDUCE 经 ASTRA-Sim**（TP collective 验证）。无 MoE ALLGATHER/REDUCESCATTER 属预期（smoke 配置 1 层 + first_k=1 = 全 dense，符合 first_k 逻辑）
+  - 原生编译三处修复（不改 astra-sim 源码）：① `PROTOBUF_FROM_SOURCE=True` 用 protobuf CONFIG target；② `--start-group` 包裹 `/usr/local` 全部 absl 静态库（循环依赖）；③ shadow-include 覆盖 `absl/base/options.h` 的 `ABSL_OPTION_USE_STD_STRING_VIEW 0→2`（系统 `/usr/local` abseil 安装不一致:头文件写 0 但库按 std::string_view 编;系统头 root 只读）
+  - chakra 经 namespace-package 符号链接装进 vllm_020（源码无 `__init__.py`、pip build 被代理阻塞）；pyinstrument 已装；protobuf 6.33.6 已满足
+  - 占位 perf bundle → **latency 数值不可信**，本 smoke 只验证执行路径 + IPC，不验证 cycle 真实性
+  - 期间修第三个 simulator bug：`__main__.py` dtype-peek（① 缺 `../` 前缀致 chdir 到 astra-sim 后读不到 cluster config；② 读顶层 `instances` 而非 `nodes[].instances`，torch_dtype 探测一直失效）——GLM-5.1 `torch_dtype=null` + 不传 `--dtype` 时暴露
+
+- ✅ Phase 4.1：上游 issue 草稿 `GLM5_1_UPSTREAM_ISSUE_DRAFT.md`（英文）——架构差异表 / 提议的 profiler+simulator 改动 / 3 个模型无关 bug（可拆独立小 PR）/ 已原型化清单 / 4 个待维护者确认的开放问题（DSA 是否独立 catalog、MLA attention 查表维度、noaux_tc 路由、MTP）。**未发布**，待人工 review 后粘贴到 casys-kaist/LLMServingSim
 
 ### 阻塞中
-- ⏸ ASTRA-Sim 子进程端到端跑通（需要 `astrasim/tutorial-micro2024` docker 容器 + `scripts/compile.sh` 编译，本机未拉镜像）
 - ⏸ 等 H20 服务器访问 → Phase 1.3-1.7 / Phase 2.5 / 2.6 / Phase 3 全部
 
 ---
@@ -177,10 +200,10 @@ model_type: "glm_moe_dsa"                    → 需要 profiler/models/glm_moe_
 1. ~~**Phase 1.1**：起草 `profiler/models/glm_moe_dsa.yaml`~~ ✅ 2026-06-03 完成
 2. ~~**Phase 1.2**：patch `profiler/core/config.py::SHARD_FIELDS`~~ ❌ 撤销（源码确认无需改）
 3. ~~**Phase 2.1+2.2**：`memory_model.py` MLA 分支~~ ✅ 2026-06-03 完成（2.1 完整，2.2 部分）
-4. **ASTRA-Sim 子进程端到端**：拉 `astrasim/tutorial-micro2024` 镜像 + 跑 `scripts/compile.sh` + `python -m serving --cluster-config configs/cluster/single_node_glm51_smoke.json --workload <small>.jsonl`，验证 simulator 全栈跑得通（数据不可信，结构可验证）
+4. ~~**ASTRA-Sim 子进程端到端**~~ ✅ 2026-06-04 完成（**原生编译**，非 docker；tp=1 + tp=2 ep=2 两档 smoke 跑通，见第 6 节）
 5. ~~**Phase 2.7**：shared expert 加 dense.csv 条目 或 MoE 时间补常数~~ ❌ 2026-06-04 撤销（shared expert 在 FusedMoE 内部，moe.csv 已含，见决策日志）
 6. **Phase 2.9 H20 8 卡 cluster config 模板**：`configs/cluster/h20_8_glm5_1_fp8.json`，先写结构，bw / latency 留占位待 H20 实测填（~30 分钟）
-7. **Phase 4.1**：起草 LLMServingSim issue（描述需求 + 链接本文档，30 分钟）
+7. ~~**Phase 4.1**：起草 LLMServingSim issue（描述需求 + 链接本文档，30 分钟）~~ ✅ 2026-06-04 完成（草稿落在 `GLM5_1_UPSTREAM_ISSUE_DRAFT.md`，未发布）
 
 ---
 
@@ -202,3 +225,4 @@ model_type: "glm_moe_dsa"                    → 需要 profiler/models/glm_moe_
 | 2026-06-04 | **`first_k_dense_replace` 逐层 dense/MoE 切换 ✅ 已实现** | 用户指出 GLM-5.1 前 `first_k_dense_replace` 层是 dense MLP、其余才 MoE。simulator 原本完全没处理（`is_moe` 全局布尔、所有层一刀切 MoE、block-copy 复制单一 block）。实现：① `_is_moe_layer(config, layer_num)`（`layer_num >= first_k_dense_replace` 且 `moe_layer_freq` 取模）；② `_emit_post_attn_layers` 逐层判断替换全局 `ctx.is_moe`；③ block-copy 主循环 + interleaved 中段改用 `_layer_segments()` 分段建块复制（dense 段 ×first_k + MoE 段 ×(num_layers-first_k)），`first_k=0`/`freq<=1` 退回单段快路径（零回归），`freq>1` 退回逐层；④ `memory_model.get_weight` 按段累加（heaviest-rank 上界，pp=1 精确）。dry-run：nl=2 fk=1→1+1、nl=4 fk=3→3+1、fk=0 全 moe，两条 emit 路径（block-copy / block_mode）输出一致 |
 | 2026-06-04 | config_builder + memory_model MoE 检测补 `n_routed_experts` fallback ✅ 已修 | 原 `config_builder.py:35` 与 `memory_model.py:57` 的 `is_moe` 都只认 `num_local_experts`/`num_experts`，不认 DeepSeek/GLM 的 `n_routed_experts` → GLM 被当 dense（config_builder：ep_size 默认 1、ep-divides-experts 校验跳过；memory_model：256-expert 层错按 dense FFN 算权重，严重低估）。三处（trace_generator:1469 / config_builder:35,88 / memory_model:57）现一致加 `n_routed_experts` fallback，等价修复所有 DeepSeek-V2/V3/GLM-MoE 的 EP 默认、整除校验与权重核算 |
 | 2026-06-04 | **撤销 Phase 2.7**：shared expert 不在 simulator 单独 emit | 源码 + trace 证实 shared expert 在 `FusedMoE.forward` 内部计算（`DeepseekV2MoE.forward` 仅一次 `self.experts(...)`；`moe_runner.py:273` `_moe_forward_shared` routed+shared 同一 forward；trace `moe_shared_experts` 嵌套于 `moe.fused_experts`）。profiler hook 整个 FusedMoE → moe.csv 已含 shared 时间。simulator 再 emit 会双计。更正了 R6 的错误结论。剩余仅 H20-time 校验：确认 profiler 强制路由 patch 未 bypass shared-expert kernel（次要风险：EP>1 时 shared 应按 rank 输入 token 数而非 routed local_tokens 缩放，moe.csv 在 ep=1 profile，留待 H20 数据回归评估） |
+| 2026-06-04 | **Phase 2.8 重定义：`noaux_tc` 实现 → group-limited routing；GLM-5.1 无需** | 用户问"未用真实 gate 权重会否造成专家分布异常"。结论否（对 GLM-5.1）。理由链：(1) **模拟器只消费聚合负载**——`trace_generator.py:1081-1100` 只用 per-rank `(local_tokens, activated_experts)` 做 `_lookup_moe` + comm size + `max_rank_latency` barrier，从不关心"是哪个专家"；唯一相关的"异常"是 rank 间负载不均。(2) **noaux_tc 的设计目标就是专家均衡**（偏置项替代 aux-loss），方向与 `BALANCED` 的"均匀流量"假设（`gate_function.py:117-119`）一致。(3) **GLM-5.1 `n_group=1, topk_group=1`** → 无 group 结构，等于全局 top-8，正是 BALANCED 建模最准的场景。(4) **忠实 noaux_tc 打分不可实现**——sigmoid 打分 + 偏置 + top-k 依赖真实权重 × 真实 activation，模拟器两样皆无；造 score 会退化成均匀随机，反不如 BALANCED 贴合"均衡"真相。唯一**可实现**的部分是 group-limited routing（`n_group`/`topk_group` 是确定性结构，不依赖权重）：在 `route_ep` 加按组掩码 + EP-to-group 对齐，~半天工作量；但 GLM-5.1 `n_group=1` 下是 no-op，**只对 DeepSeek-V3 家族（`n_group=8, topk_group=4`）有意义**。故 Phase 2.8 对 GLM-5.1 降级 P3/无需，BALANCED 即物理合理近似；`routed_scaling_factor`/`norm_topk_prob`/sigmoid 只影响路由权重值不影响 token 计数，与延迟模型无关 |
