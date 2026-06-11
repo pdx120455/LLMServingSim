@@ -14,7 +14,7 @@ class Device(Enum):
     CXL = 3
 
 class MemoryModel():
-    def __init__(self, model, instance_id, node_id, num_npus, tp_size, npu_mem, cpu_mem, block_size, fp, enable_prefix_caching, enable_prefix_sharing, prefix_pool, prefix_storage, cxl_mem=0, ep_size=1, pp_size=1, kv_cache_dtype='auto'):
+    def __init__(self, model, instance_id, node_id, num_npus, tp_size, npu_mem, cpu_mem, block_size, fp, enable_prefix_caching, enable_prefix_sharing, prefix_pool, prefix_storage, cxl_mem=0, ep_size=1, pp_size=1, kv_cache_dtype='auto', weight_fp=None):
         self.model = model
         self.node_id = node_id
         self.instance_id = instance_id
@@ -26,7 +26,11 @@ class MemoryModel():
         self.cpu_mem = cpu_mem * GB_TO_BYTE # GB -> Byte
         self.cxl_mem = cxl_mem * GB_TO_BYTE
         self.block_size = block_size
+        # ``fp`` is the activation/compute precision (bf16 even for fp8/int8
+        # checkpoints); ``weight_fp`` is the stored-weight precision. The KV
+        # cache holds activation-precision values unless explicitly fp8.
         self.fp = fp // 8 # bit -> byte of floating point
+        self.weight_fp = (weight_fp if weight_fp is not None else fp) // 8
         self.kv_fp = 1 if kv_cache_dtype == 'fp8' else self.fp  # KV cache bytes per element
         self.enable_prefix_caching = enable_prefix_caching
         self.enable_prefix_sharing = enable_prefix_sharing
@@ -127,7 +131,7 @@ class MemoryModel():
         tp = self.tp_size
         pp = max(self.pp_size, 1)
         ep = self.ep_size
-        fp = self.fp
+        fp = self.weight_fp  # weights are stored at checkpoint precision
         weight = 0
 
         _, embedding, _ = calculate_sizes(self.model, 'embedding', 1, parallel=tp, fp=fp)
@@ -700,9 +704,10 @@ def full_cluster_kv_bytes_per_token(model, fp, kv_cache_dtype='auto'):
     """Bytes of KV cache per token aggregated over the full TP cluster.
 
     Mirrors MemoryModel.get_kv(1) * num_npus but computes directly, avoiding
-    the per-rank floor-division roundoff. ``fp`` is the model weight dtype
-    in bits (16, 32, ...). ``kv_cache_dtype='fp8'`` forces 1 byte per element
-    for the KV cache regardless of weight dtype.
+    the per-rank floor-division roundoff. ``fp`` is the activation/compute
+    dtype in bits (16, 32, ...) — the KV cache holds activation-precision
+    values, not weight-precision ones. ``kv_cache_dtype='fp8'`` forces 1 byte
+    per element for the KV cache regardless of activation dtype.
 
     For MLA architectures (``kv_lora_rank`` present in config), the cache
     stores a single replicated latent (``kv_lora_rank + qk_rope_head_dim``)
@@ -724,12 +729,17 @@ def full_cluster_kv_bytes_per_token(model, fp, kv_cache_dtype='auto'):
 
 
 # calculate the per-rank input, weight, output size of each layer
-def calculate_sizes(model, layer_name, length, kv_len=None, pim=False, parallel=1, fp=2):
+def calculate_sizes(model, layer_name, length, kv_len=None, pim=False, parallel=1, fp=2,
+                    weight_fp=None):
     """Calculate input, weight, and output tensor sizes for a given layer.
 
     Args:
         parallel: parallelism degree for weight/activation sharding.
             For dense layers this is TP; for MoE experts this is EP.
+        fp: activation bytes per element (input/output sizes).
+        weight_fp: weight bytes per element; defaults to ``fp``. Quantized
+            checkpoints (fp8/int8) store weights below the activation
+            precision, so the weight component scales independently.
     """
     config = get_config(model)
     n_embd = config['hidden_size']
@@ -935,5 +945,10 @@ def calculate_sizes(model, layer_name, length, kv_len=None, pim=False, parallel=
 
     else:
         raise ValueError(f"No matching layer name {layer_name} found for model {model}.")
+
+    # Every weight_size expression above is linear in fp, so rescaling to the
+    # checkpoint's weight precision is exact (up to sub-element rounding).
+    if weight_fp is not None and weight_fp != fp:
+        weight_size = weight_size * weight_fp // fp
 
     return input_size, weight_size, output_size

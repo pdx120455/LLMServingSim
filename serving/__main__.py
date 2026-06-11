@@ -194,7 +194,15 @@ def main():
         if dtype is None:
             dtype = 'bfloat16'
         logger.info("--dtype not set; using %s (from model config torch_dtype)", dtype)
-    fp = _dtype_to_bits[dtype]
+    # --dtype names the *weight* precision (it also selects the perf variant
+    # folder). Activations — and the KV cache under kv_cache_dtype=auto —
+    # stay in the compute precision, which is bf16/fp16 even for fp8/int8
+    # weight checkpoints (quantized GEMMs dequantize per-tile; TP collectives
+    # and the latent/KV cache hold 16-bit values). Keeping a single fp here
+    # would halve every comm size and double the apparent KV capacity for
+    # fp8 models.
+    weight_fp = _dtype_to_bits[dtype]
+    fp = max(weight_fp, 16)
     request_routing_policy=args.request_routing_policy
     expert_routing_policy=args.expert_routing_policy
     enable_block_copy=args.enable_block_copy
@@ -342,6 +350,7 @@ def main():
             cxl_mem,
             ep_size=instance.get("ep_total", 1),
             kv_cache_dtype=kv_cache_dtype,
+            weight_fp=weight_fp,
         ))
 
     # Controller for astra-sim process communication
@@ -528,7 +537,7 @@ def main():
                                        nid, inst_id, max_num_batched_tokens, max_num_seqs, placement[inst_id], block_mode_on[inst_id],
                                        expert_routing_policy, enable_prefix_caching, enable_attn_offloading,
                                        power_model, pim_models[nid],
-                                       enable_sub_batch_interleaving, fp, dtype=dtype, kv_cache_dtype=kv_cache_dtype,
+                                       enable_sub_batch_interleaving, fp, weight_fp=weight_fp, dtype=dtype, kv_cache_dtype=kv_cache_dtype,
                                        tp_dim=inst.get("tp_dim"), ep_dim=inst.get("ep_dim"),
                                        dp_sum_total_len=sum_total_len, enable_block_copy=enable_block_copy)
                         generate_graph(batch, inst["hardware"], inst["num_npus"], nid,
@@ -583,7 +592,7 @@ def main():
                                            nid, inst_id, max_num_batched_tokens, max_num_seqs, placement[inst_id], block_mode_on[inst_id],
                                            expert_routing_policy, enable_prefix_caching, enable_attn_offloading,
                                            power_model, pim_models[nid],
-                                           enable_sub_batch_interleaving, fp, dtype=dtype, kv_cache_dtype=kv_cache_dtype,
+                                           enable_sub_batch_interleaving, fp, weight_fp=weight_fp, dtype=dtype, kv_cache_dtype=kv_cache_dtype,
                                            tp_dim=inst.get("tp_dim"), ep_dim=inst.get("ep_dim"),
                                            dp_sum_total_len=sum_total_len, enable_block_copy=enable_block_copy)
                             generate_graph(batch, inst["hardware"], inst["num_npus"], nid,
@@ -608,7 +617,7 @@ def main():
                                    instance["pd_type"],
                                    node_id, instance_id, max_num_batched_tokens, max_num_seqs, placement[instance_id], block_mode_on[instance_id],
                                    expert_routing_policy, enable_prefix_caching, enable_attn_offloading, power_model, pim_models[node_id],
-                                   enable_sub_batch_interleaving, fp, dtype=dtype, kv_cache_dtype=kv_cache_dtype,
+                                   enable_sub_batch_interleaving, fp, weight_fp=weight_fp, dtype=dtype, kv_cache_dtype=kv_cache_dtype,
                                    enable_block_copy=enable_block_copy)
                     generate_graph(new_req, instance["hardware"], instance["num_npus"], node_id,
                                    instance_id, inst2npu_mapping[instance_id], enable_local_offloading)
