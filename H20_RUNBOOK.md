@@ -35,15 +35,16 @@ n_routed_experts / kv_lora_rank / q_lora_rank / index_* 等)已正确,不用动�
 **不认识 `GlmMoeDsaForCausalLM`**(该架构在 0.20.1+ 才进 vLLM;trace 用的 0.20.1,
 源码分析用的 0.21)。
 
-**操作**:把 `scripts/docker-vllm.sh` 的镜像 tag 换成 H20 上可用、且能
-`from vllm.model_executor.models.deepseek_v2 import GlmMoeDsaForCausalLM` 的版本
-(建议 0.20.1 或 0.21,和你 trace 那台一致最稳)。换完先验一行:
+**操作**:把 `scripts/docker-vllm.sh` 的镜像 tag 换成 **vLLM 0.21**(必须 pin 0.21,
+不要用 0.20.1 —— 架构 yaml 的类名按 0.21 源码写定,profiler 的 MoE hook 也按 0.21
+MoERunner API 重写并验证;0.20.1 可能 catalog 不命中)。换完先验一行:
 ```bash
 python3 -c "from vllm.model_executor.models.deepseek_v2 import GlmMoeDsaForCausalLM; print('ok')"
 ```
-> 副作用提醒:profiler 的 MoE hook 是 `patch FusedMoE.forward_native` **强制专家路由**,
-> 方法名 version-specific(CLAUDE.md 注)。若换了 vLLM 版本,Step 2 跑 MoE 那次若报
-> hook 找不到方法,需到 `profiler/core/hooks/moe_hook.py` 对齐方法名。
+> MoE hook 已适配 0.21(2026-06-11,commit `7bdde56`):双入口 patch + monolithic
+> quant method 守卫。**Step 2 之前先跑 hook 自检**(见 Step 2 内说明);若守卫报
+> "monolithic quant method ... forced expert routing cannot apply",用
+> `VLLM_USE_FLASHINFER_MOE_FP8=0`(或对应 env)关掉融合 MoE 后端再跑。
 
 ---
 
@@ -96,6 +97,13 @@ vLLM 的 model dtype 不接受 fp8,量化由 checkpoint 的 `quantization_config
 ---
 
 ## Step 2 — profile MoE(必须单独一轮,Phase 1.4/1.5)
+
+**先跑 hook 自检**(单卡,1 分钟,验证强制专家路由在当前 vLLM/后端组合下真实生效):
+```bash
+python -m profiler.core.hooks.verify_moe_hook
+# 期望输出:forced distinct experts == 目标值 + "MOE HOOK VERIFIED"
+# 若报 monolithic 守卫错误:VLLM_USE_FLASHINFER_MOE_FP8=0 后重试(并在正式 profile 时带同样的 env)
+```
 
 config `first_k_dense_replace` 让 profiler 默认压成的"第 0 层"落在 **dense MLP**,
 `moe.csv` 会是空的。强制第 0 层变 MoE:
@@ -184,6 +192,10 @@ python -m serving \
 ```
 **`--dtype fp8` 关键**:① 让 variant 解析到 `fp8/`(匹配 Step 1 的 VARIANT);
 ② memory_model 按 1 byte/权重算(fp8 checkpoint 正确显存),不设会按 2 byte 高估 2×。
+> 2026-06-11 起 `--dtype fp8` 语义已修正(commit `43b12c4`):只影响**权重**精度;
+> 通信量(ALLREDUCE/MoE dispatch)和 KV cache 自动保持 bf16(2 byte),与真实
+> vLLM 行为一致。修复前的版本会把通信量减半 + KV 容量 2× 高估,**确保 simulator
+> 代码 ≥ 该 commit 再跑 Step 6**。
 
 跑前确认前置 1 已还原真实层数,否则 simulator 只算 1 层。
 
@@ -233,7 +245,8 @@ python -m bench validate \
 # 前置:改 configs/model/zai-org/GLM-5.1.json 真实层数 + 换 vLLM 镜像 tag
 ./scripts/docker-vllm.sh                                    # 进 vLLM 容器
 # Step1 dense/attn:  profile.sh 设 MODEL/HARDWARE=H20/VARIANT=fp8/SKIP_SKEW=1 → ./profiler/profile.sh
-# Step2 moe:         profile.sh 加 HF_OVERRIDES='{"first_k_dense_replace":0}' → ./profiler/profile.sh
+# Step2 moe:         先 python -m profiler.core.hooks.verify_moe_hook(hook 自检)
+#                     再 profile.sh 加 HF_OVERRIDES='{"first_k_dense_replace":0}' → ./profiler/profile.sh
 # Step3 skew(可选): ONLY_SKEW=1 ./profiler/profile.sh
 # Step4: 填 configs/cluster/h20_8_glm5_1_fp8.json 真实 bw/latency
 python -m bench run --model zai-org/GLM-5.1 --dataset <ds> --output-dir bench/results/glm51_h20 \

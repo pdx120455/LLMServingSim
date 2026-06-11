@@ -52,7 +52,7 @@ model_type: "glm_moe_dsa"                    → 需要 profiler/models/glm_moe_
 | 1.1 | 新增 `profiler/models/glm_moe_dsa.yaml`，映射 14 个核心 class | 新文件 | P0 | 0.5d | ✅ 2026-06-03 完成（13 dense + 2 per_seq + 1 attention + 1 moe，pydantic 验证通过） |
 | 1.2 | ~~`SHARD_FIELDS` 加入 `q_lora_rank, kv_lora_rank`~~ | `profiler/core/config.py:39` | ~~P0~~ | - | ❌ 2026-06-03 撤销：源码确认 LoRA 段不沿 TP 切，无需新增（见决策日志） |
 | 1.3 | profiler 能在 H20 上以 `--skip-skew --skip-moe-shared` 启动并写出 dense/per_sequence/attention CSV | 运行验证 | P0 | 0.5d | 人 + Claude |
-| 1.4 | MoE category 支持 shared expert：在 fire() 中标注 "shared 必激活" | `profiler/core/hooks/moe_hook.py`, `categories.py::ExpertCategory` | P0 | 1d | Claude |
+| 1.4 | MoE category 支持 shared expert：在 fire() 中标注 "shared 必激活" | `profiler/core/hooks/moe_hook.py`, `categories.py::ExpertCategory` | P0 | 1d | Claude。**前置已解**：hook 已重写适配 vLLM 0.21 MoERunner（R11，commit `7bdde56`，5060Ti 验证通过）；H20 上先跑 `python -m profiler.core.hooks.verify_moe_hook` 复验 |
 | 1.5 | 处理 `first_k_dense_replace`：profile 两种 layer（dense MLP 层 + MoE 层），写到不同 CSV 段 | `profiler/core/runner.py`, `categories.py` | P1 | 1d | Claude |
 | 1.6 | Lightning Indexer 作为独立 layer 出现在 dense.csv（或新建 indexer.csv） | `profiler/models/glm_moe_dsa.yaml`, `categories.py` | P1 | 0.5d | Claude |
 | 1.7 | FP8 variant 自动命名 `fp8-bf16kv` / `fp8` —— 当前 `effective_variant` 应该已支持 | 验证 `profiler/core/config.py::ProfileArgs.effective_variant` | P2 | 0.1d | Claude |
@@ -112,6 +112,13 @@ model_type: "glm_moe_dsa"                    → 需要 profiler/models/glm_moe_
 - **R7**: H20 NVL 8 卡的拓扑 ASTRA-Sim 是否已建模 —— 大概率要新写 network.yml 模板
 - **R8**: MTP head 暂不支持，real bench 时需要禁用（`--num-speculative-tokens 0`）保证对比公平
 - **R9**: 模型权重 357GB FP8，H20 8 卡 × 96GB = 768GB 够，但 KV cache 留多少需要算（202752 context × 78 layer × 512 kv_lora_rank × FP8 ≈ 8GB / sequence！）
+
+### 2026-06-11 架构评审新增（R10/R11 已修复，R12-R14 记录在案）
+- **R10 ✅ 已修**: simulator 单一 `fp` 混淆 weight/activation/KV 三种精度 —— `--dtype fp8` 会把通信量减半 + KV 容量 2× 高估（真实 activation/latent-KV 是 bf16）；`--dtype bfloat16` 则权重 2× 高估且 variant 不匹配。**无参数组合能同时正确**。修复：`fp` 语义改为 activation 精度（`max(weight_bits,16)`），新增 `weight_fp` 走权重核算（commit `43b12c4`，bf16 路径 bit-exact 回归 + fp8 trace 三点验证）
+- **R11 ✅ 已修**: profiler MoE hook 在 vLLM 0.21 上 API 不存在 —— `FusedMoE.forward_native` 已被移除（`forward` 委托 MoERunner），MoE profile 启动即 AttributeError；0.19 有 hook 但不认识 GlmMoeDsaForCausalLM（版本死锁）。修复：双入口 patch + `runner.router._compute_routing` 锻造 + monolithic quant method 守卫（commit `7bdde56`，5060Ti `verify_moe_hook.py` 实测 5 forced vs 8 natural）
+- **R12**: Indexer 成本被建模为 O(tokens)，但 DSA indexer 要对全部缓存 token 打分（`sm90_fp8_paged_mqa_logits` 是 O(kv_len)）—— 长上下文 decode 系统性低估。**第一轮验证 workload 必须避开长上下文**；长上下文支持留待 Phase 2.6 拆 indexer category
+- **R13**: KV 内存漏算 indexer k-cache（~128B/token FP8，约 11% 低估）；`modules_to_not_convert`（embed/lm_head/norms 保持 BF16）在 fp8 权重核算下被低估（per-rank 数百 MB 量级，占比小）
+- **R14**: 验证方法学 —— ① profile 边界（`ATTENTION_MAX_KV`、`MAX_NUM_BATCHED_TOKENS`）必须 ≥ 验证 workload 实际分布，否则全程外推；② 单 workload 通过可能是过拟合，建议至少两个长度 regime；③ profile 与 bench 必须 pin 同一 vLLM 版本（yaml 类名按 0.21 写定 → 两边都用 0.21，**不要**用 0.20.1）
 
 ---
 
@@ -188,6 +195,11 @@ model_type: "glm_moe_dsa"                    → 需要 profiler/models/glm_moe_
 
 - ✅ Phase 4.1：上游 issue 草稿 `GLM5_1_UPSTREAM_ISSUE_DRAFT.md`（英文）——架构差异表 / 提议的 profiler+simulator 改动 / 3 个模型无关 bug（可拆独立小 PR）/ 已原型化清单 / 4 个待维护者确认的开放问题（DSA 是否独立 catalog、MLA attention 查表维度、noaux_tc 路由、MTP）。**未发布**，待人工 review 后粘贴到 casys-kaist/LLMServingSim
 
+### 已完成（2026-06-11，架构评审整改）
+- ✅ 资深架构师视角全方案评审：定位 2 个致命缺陷（R10 fp 三轨混淆 / R11 moe_hook 0.21 API 失效，均不在原 R1-R9 内、均会报废 Phase 3 验证），3 项中低风险记录（R12-R14）
+- ✅ **Fix 1（commit `43b12c4`）**：dtype 三轨拆分 —— `fp` 改为 activation 精度、新增 `weight_fp`（serving/__main__.py / scheduler / memory_model / trace_generator 四文件）。验证：bf16 smoke CSV bit-exact；`--dtype fp8` 下 o_proj weight 100663296→50331648（减半 ✅）、ALLREDUCE comm 122880 不变 ✅、KV 1152B/token 不变 ✅。**`--dtype fp8` 现在是 H20 模拟的正确用法**
+- ✅ **Fix 2（commit `7bdde56`）**：moe_hook 适配 vLLM 0.21 —— 双入口（forward_native ≤0.20 / forward ≥0.21）+ `runner.router._compute_routing` 实例级锻造 + monolithic 守卫（FlashInfer/TRT-LLM 融合路由不可强制时报错而非静默垃圾）。新增 `profiler/core/hooks/verify_moe_hook.py` 单卡自检（H20 换版本后必跑）。5060Ti vLLM 0.21.0 实测：forced 5 distinct experts vs natural 8，restore 无泄漏
+
 ### 阻塞中
 - ⏸ 等 H20 服务器访问 → Phase 1.3-1.7 / Phase 2.5 / 2.6 / Phase 3 全部
 
@@ -225,4 +237,5 @@ model_type: "glm_moe_dsa"                    → 需要 profiler/models/glm_moe_
 | 2026-06-04 | **`first_k_dense_replace` 逐层 dense/MoE 切换 ✅ 已实现** | 用户指出 GLM-5.1 前 `first_k_dense_replace` 层是 dense MLP、其余才 MoE。simulator 原本完全没处理（`is_moe` 全局布尔、所有层一刀切 MoE、block-copy 复制单一 block）。实现：① `_is_moe_layer(config, layer_num)`（`layer_num >= first_k_dense_replace` 且 `moe_layer_freq` 取模）；② `_emit_post_attn_layers` 逐层判断替换全局 `ctx.is_moe`；③ block-copy 主循环 + interleaved 中段改用 `_layer_segments()` 分段建块复制（dense 段 ×first_k + MoE 段 ×(num_layers-first_k)），`first_k=0`/`freq<=1` 退回单段快路径（零回归），`freq>1` 退回逐层；④ `memory_model.get_weight` 按段累加（heaviest-rank 上界，pp=1 精确）。dry-run：nl=2 fk=1→1+1、nl=4 fk=3→3+1、fk=0 全 moe，两条 emit 路径（block-copy / block_mode）输出一致 |
 | 2026-06-04 | config_builder + memory_model MoE 检测补 `n_routed_experts` fallback ✅ 已修 | 原 `config_builder.py:35` 与 `memory_model.py:57` 的 `is_moe` 都只认 `num_local_experts`/`num_experts`，不认 DeepSeek/GLM 的 `n_routed_experts` → GLM 被当 dense（config_builder：ep_size 默认 1、ep-divides-experts 校验跳过；memory_model：256-expert 层错按 dense FFN 算权重，严重低估）。三处（trace_generator:1469 / config_builder:35,88 / memory_model:57）现一致加 `n_routed_experts` fallback，等价修复所有 DeepSeek-V2/V3/GLM-MoE 的 EP 默认、整除校验与权重核算 |
 | 2026-06-04 | **撤销 Phase 2.7**：shared expert 不在 simulator 单独 emit | 源码 + trace 证实 shared expert 在 `FusedMoE.forward` 内部计算（`DeepseekV2MoE.forward` 仅一次 `self.experts(...)`；`moe_runner.py:273` `_moe_forward_shared` routed+shared 同一 forward；trace `moe_shared_experts` 嵌套于 `moe.fused_experts`）。profiler hook 整个 FusedMoE → moe.csv 已含 shared 时间。simulator 再 emit 会双计。更正了 R6 的错误结论。剩余仅 H20-time 校验：确认 profiler 强制路由 patch 未 bypass shared-expert kernel（次要风险：EP>1 时 shared 应按 rank 输入 token 数而非 routed local_tokens 缩放，moe.csv 在 ep=1 profile，留待 H20 数据回归评估） |
+| 2026-06-11 | **架构评审：修复 fp 三轨混淆（R10）+ moe_hook 0.21 失效（R11），两者均为 H20 前必修** | 评审代码核实：① `serving/__main__.py:197` 单一 `fp` 同时驱动权重/通信/KV —— GLM-5.1 真实三轨是 weight=FP8(1B)、activation=BF16(2B，trace `cross_device_reduce_1stage<__nv_bfloat16>` 直接证明)、MLA latent KV=BF16(2B)，任何 `--dtype` 取值都至少错两轨；② vLLM 0.21 `FusedMoE(PluggableLayer)` 无 `forward_native`（`forward` 委托 MoERunner），旧 hook 必 AttributeError，且 0.21 上从未被执行过（本机跑通的全是 dense 模型）。修复见 commit `43b12c4` / `7bdde56`，验证证据见 §6 2026-06-11 节。同批记录 R12（indexer O(kv_len) 缺失 → 第一轮验证避开长上下文）/ R13（indexer k-cache ~11% + modules_to_not_convert）/ R14（profile 边界 ≥ workload 分布、双长度 regime、vLLM 版本三方 pin 0.21） |
 | 2026-06-04 | **Phase 2.8 重定义：`noaux_tc` 实现 → group-limited routing；GLM-5.1 无需** | 用户问"未用真实 gate 权重会否造成专家分布异常"。结论否（对 GLM-5.1）。理由链：(1) **模拟器只消费聚合负载**——`trace_generator.py:1081-1100` 只用 per-rank `(local_tokens, activated_experts)` 做 `_lookup_moe` + comm size + `max_rank_latency` barrier，从不关心"是哪个专家"；唯一相关的"异常"是 rank 间负载不均。(2) **noaux_tc 的设计目标就是专家均衡**（偏置项替代 aux-loss），方向与 `BALANCED` 的"均匀流量"假设（`gate_function.py:117-119`）一致。(3) **GLM-5.1 `n_group=1, topk_group=1`** → 无 group 结构，等于全局 top-8，正是 BALANCED 建模最准的场景。(4) **忠实 noaux_tc 打分不可实现**——sigmoid 打分 + 偏置 + top-k 依赖真实权重 × 真实 activation，模拟器两样皆无；造 score 会退化成均匀随机，反不如 BALANCED 贴合"均衡"真相。唯一**可实现**的部分是 group-limited routing（`n_group`/`topk_group` 是确定性结构，不依赖权重）：在 `route_ep` 加按组掩码 + EP-to-group 对齐，~半天工作量；但 GLM-5.1 `n_group=1` 下是 no-op，**只对 DeepSeek-V3 家族（`n_group=8, topk_group=4`）有意义**。故 Phase 2.8 对 GLM-5.1 降级 P3/无需，BALANCED 即物理合理近似；`routed_scaling_factor`/`norm_topk_prob`/sigmoid 只影响路由权重值不影响 token 计数，与延迟模型无关 |
