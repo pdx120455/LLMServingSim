@@ -142,6 +142,16 @@ def _add_common_flags(p: argparse.ArgumentParser) -> None:
                    help="Skip the per-TP skew profiling step (skew.csv). "
                         "Alpha formula fit relies on this data; only skip "
                         "for quick uniform-attention-only runs.")
+    p.add_argument("--skip-moe", action="store_true", default=False,
+                   dest="skip_moe",
+                   help="Skip the moe category. Required for the dense "
+                        "round of MoE models whose first profiled layer is "
+                        "dense (e.g. GLM-5.1 / DeepSeek with "
+                        "first_k_dense_replace > 0): the single-layer test "
+                        "model then has no FusedMoE and firing moe shots "
+                        "would abort the sweep. Profile moe in a separate "
+                        "round with --hf-overrides "
+                        "'{\"first_k_dense_replace\": 0}'.")
     p.add_argument("--skew-n-factor", type=float, default=2.0,
                    dest="skew_n_factor",
                    help="Geometric factor for the skew n (total decodes) "
@@ -350,6 +360,7 @@ def _build_profile_args(
         attention_kv_factor=ns.attention_kv_factor,
         measurement_iterations=ns.measurement_iterations,
         skip_skew=getattr(ns, "skip_skew", False),
+        skip_moe=getattr(ns, "skip_moe", False),
         skew_n_factor=getattr(ns, "skew_n_factor", 2.0),
         skew_pc_factor=getattr(ns, "skew_pc_factor", 2.0),
         skew_kp_factor=getattr(ns, "skew_kp_factor", 2.0),

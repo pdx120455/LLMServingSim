@@ -395,6 +395,14 @@ class ProfileArgs:
     written and alpha fit cannot run). Useful for quick profile runs
     that only need uniform attention data."""
 
+    skip_moe: bool = False
+    """If True, skip the moe category. Required for the dense round
+    of MoE models whose first profiled layer is dense (e.g. GLM-5.1 /
+    DeepSeek with first_k_dense_replace > 0): the single-layer test
+    model then has no FusedMoE and firing moe shots would abort the
+    whole sweep. Profile moe separately with
+    --hf-overrides '{"first_k_dense_replace": 0}'."""
+
     # Skew grid density. Mirrors the attention factor knobs — the
     # default 2.0 (doubling) is what ships today; crank higher
     # (e.g. 4.0) to coarsen the sweep and cut profile time when the

@@ -76,6 +76,16 @@ ATTENTION_KV_FACTOR=2.0
 # ~5% at ~3x profile time.
 MEASUREMENT_ITERATIONS=3
 
+# --- MoE category -----------------------------------------------------------
+# Set SKIP_MOE=1 to skip the moe category. Required for the dense
+# round of MoE models whose first profiled layer is dense (e.g.
+# GLM-5.1 / DeepSeek with first_k_dense_replace > 0): the single-layer
+# test model then has no FusedMoE and firing moe shots would abort the
+# whole sweep. Run a second round without SKIP_MOE and with
+# HF_OVERRIDES='{"first_k_dense_replace":0}' to fill moe.csv (resume
+# mode skips the already-measured dense/attention shots).
+# SKIP_MOE=1
+
 # --- Skew profiling ---------------------------------------------------------
 # After the uniform attention grid, also profile heterogeneous
 # decode-kv batches (1-2 hours per TP). Required for the alpha
@@ -134,6 +144,7 @@ cmd=(python3 -m profiler profile "$MODEL" --hardware "$HARDWARE")
 [[ -n "${ATTENTION_KV_FACTOR:-}" ]]    && cmd+=(--attention-kv-factor "$ATTENTION_KV_FACTOR")
 [[ -n "${MEASUREMENT_ITERATIONS:-}" ]] && cmd+=(--measurement-iterations "$MEASUREMENT_ITERATIONS")
 [[ -n "${SKIP_SKEW:-}" ]]              && cmd+=(--skip-skew)
+[[ -n "${SKIP_MOE:-}" ]]               && cmd+=(--skip-moe)
 [[ -n "${SKEW_N_FACTOR:-}" ]]          && cmd+=(--skew-n-factor "$SKEW_N_FACTOR")
 [[ -n "${SKEW_PC_FACTOR:-}" ]]         && cmd+=(--skew-pc-factor "$SKEW_PC_FACTOR")
 [[ -n "${SKEW_KP_FACTOR:-}" ]]         && cmd+=(--skew-kp-factor "$SKEW_KP_FACTOR")
