@@ -256,6 +256,9 @@ H20 公开规格:HBM3 96GB、显存带宽 **4.0 TB/s**、NVLink **900 GB/s(双�
   (= profile 的 ATTENTION_MAX_KV 上界;超界 lookup 线性外推)。且 DSA indexer
   的 O(kv_len) 成本未建模(R12),长上下文误差会系统性偏大——那是 Step 8/Phase 2.5
   的事,别混进首轮。
+- **离线生成数据集**(内网无法用 ShareGPT generator):
+  `python3 workloads/generators/synthetic_glm51.py --num-reqs 64 --sps 10 --input-min 128 --input-max 1024 --output-min 64 --output-max 512 --output workloads/glm51_synth_64.jsonl`
+  —— 纯标准库、不联网、无需 tokenizer,从 config 读 `vocab_size` 生成合法随机 id(延迟只取决于 token 数,内容无关)。`--seq-guard`(默认 4096)守住长度边界。**Step 5 `bench run` 与 Step 6 simulator 用同一份数据集 + 同一个 `--num-reqs`**。注:随机 id ⇒ prefix-cache 命中≈0(两侧一致、可比,但不反映真实前缀复用)。
 
 ```bash
 # --model 用 H20 本地 checkpoint 目录(传 HF id 会现场下数百 GB!):
