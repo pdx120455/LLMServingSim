@@ -61,6 +61,12 @@ def register_args(p: argparse.ArgumentParser) -> None:
     p.add_argument("--max-model-len", type=int, default=None,
                    dest="max_model_len",
                    help="vLLM max_model_len (None = model's max).")
+    p.add_argument("--gpu-memory-utilization", type=float, default=0.9,
+                   dest="gpu_memory_utilization",
+                   help="vLLM gpu_memory_utilization (0-1): fraction of each "
+                        "GPU's memory used for weights + KV cache. Default "
+                        "0.9. Raise (0.92-0.95) to fit a tight large model "
+                        "like GLM-5.1; watch nvidia-smi after load.")
     p.add_argument("--dtype", default="bfloat16",
                    help="Model dtype.")
     p.add_argument("--kv-cache-dtype", default="auto",
@@ -154,6 +160,7 @@ async def _drive(args: argparse.Namespace, requests: list[dict], output_dir: Pat
         max_num_seqs=args.max_num_seqs,
         max_num_batched_tokens=args.max_num_batched_tokens,
         max_model_len=args.max_model_len,
+        gpu_memory_utilization=args.gpu_memory_utilization,
         dtype=args.dtype,
         kv_cache_dtype=args.kv_cache_dtype,
         seed=args.seed,
@@ -277,7 +284,8 @@ def _engine_kwargs_for_meta(engine_args) -> dict:
     fields = (
         "model", "tensor_parallel_size", "data_parallel_size",
         "enable_expert_parallel", "max_num_seqs", "max_num_batched_tokens",
-        "max_model_len", "dtype", "kv_cache_dtype", "seed",
+        "max_model_len", "gpu_memory_utilization", "dtype", "kv_cache_dtype",
+        "seed",
     )
     return {k: getattr(engine_args, k, None) for k in fields}
 

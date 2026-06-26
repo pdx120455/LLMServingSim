@@ -271,6 +271,8 @@ python -m bench run \
   --enable-expert-parallel \
   --max-num-seqs 256 \
   --max-num-batched-tokens 2048 \
+  --max-model-len 4096 \
+  --gpu-memory-utilization 0.92 \
   --dtype bfloat16 \
   --kv-cache-dtype auto \
   --num-reqs 32 \
@@ -279,6 +281,13 @@ python -m bench run \
 先 `--num-reqs 32` 小跑确认能端到端出结果(模型加载 + 首批请求 ≈ 15-40min),
 再去掉(或调大)`--num-reqs` 跑全量,`--output-dir` 换 `bench/results/glm51_h20_full`、
 log 换 `logs/glm_bench.log`。
+
+**显存(gpu limit)**:`--gpu-memory-utilization`(0-1)= 每卡用多少显存装权重+KV,
+默认 0.9。GLM-5.1 权重几乎占满单卡,属"紧"模型:① 若加载阶段报 OOM/装不下权重,
+**往高调**(0.92~0.95)挤出空间;② 加载完务必 `nvidia-smi` 看每卡余量,贴满(>92GB)
+就说明 KV 余量很小、并发上不去。`--max-model-len 4096` 配合数据集 `--seq-guard`,让
+vLLM 按更短上限预留 KV、省显存。物理上要选卡/限卡数用 `CUDA_VISIBLE_DEVICES`(数量
+= TP×DP)。
 
 产出:`bench/results/<run>/{meta.json, requests.jsonl, timeseries.csv}`。
 
