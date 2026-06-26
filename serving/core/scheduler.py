@@ -2,6 +2,7 @@ import bisect
 import pandas as pd
 from time import time
 import csv
+import os
 
 from .request import *
 from .utils import *
@@ -57,6 +58,13 @@ class Scheduler:
             return self.schedule_with_prefix(current, sys, batch_id)
         else:
             return self.schedule_base(current, sys, batch_id)
+
+    def _get_reload_size(self, batch_req, batch_len):
+        load_size = 0
+        for req in batch_req[:batch_len]:
+            if req.evict:
+                load_size += self.memory.get_evict_kv(req)
+        return load_size
 
     # batch the request scheduling method
     def schedule_base(self, current, sys, batch_id=-1):
@@ -176,7 +184,8 @@ class Scheduler:
             temp_len = batch_len
             for i in range(batch_len, -1, -1):
                 kv_size = self.memory.get_block_kv(batch_req, i, scheduled_tokens)
-                if self.memory.is_avail(kv_size, Device.NPU):
+                load_size = self._get_reload_size(batch_req, i)
+                if self.memory.is_avail(kv_size + load_size, Device.NPU):
                     temp_len = i
                     break
             
@@ -193,16 +202,18 @@ class Scheduler:
                     continue
 
                 # else
-                evict_size += self.memory.get_evict_kv(gen_req[-1])
-                gen_req[-1].evict = True
-                self.logger.info("Eviction of the request #%d", gen_req[-1].id)
+                req_to_evict = gen_req[-1]
+                evicted_kv_size = self.memory.get_evict_kv(req_to_evict)
+                evict_size += evicted_kv_size
+                req_to_evict.evict = True
+                self.logger.info("Eviction of the request #%d", req_to_evict.id)
                 gen_req = gen_req[:-1]
                 # spill to cpu (host) memory. get_evict_kv returns per-rank
                 # bytes; cpu_used is tracked in full-cluster bytes (matches
                 # MemoryModel.apply_kv_cache_events convention), so scale by
                 # num_npus when crossing the NPU->CPU boundary.
-                self.memory.free(evict_size, Device.NPU)
-                self.memory.allocate(evict_size * self.num_npus, Device.CPU)
+                self.memory.free(evicted_kv_size, Device.NPU)
+                self.memory.allocate(evicted_kv_size * self.num_npus, Device.CPU)
 
                 if len(gen_req) < batch_len:
                     batch_len = len(gen_req)
@@ -210,16 +221,17 @@ class Scheduler:
                 # check if can batch
                 for i in range(batch_len, -1, -1):
                     kv_size = self.memory.get_block_kv(batch_req, i, scheduled_tokens)
-                    if self.memory.is_avail(kv_size, Device.NPU):
+                    load_size = self._get_reload_size(batch_req, i)
+                    if self.memory.is_avail(kv_size + load_size, Device.NPU):
                         temp_len = i
                         break
 
             batch_len = temp_len
             batch_req = batch_req[:batch_len]
-            load_size = 0
 
             # Recompute kv_size for final batch
             kv_size = self.memory.get_block_kv(batch_req, batch_len, scheduled_tokens)
+            load_size = self._get_reload_size(batch_req, batch_len)
 
             # delete from request queue
             for req in batch_req:
@@ -229,18 +241,17 @@ class Scheduler:
                         break
 
                 if req.evict:
-                    # load evicted kv cache
-                    load_size += self.memory.get_evict_kv(req)
                     req.evict = False
                     self.logger.info("Loading the request #%d", req.id)
 
             # ============ STEP 4: Allocate memory ============
             if kv_size > 0:
                 self.memory.allocate(kv_size, Device.NPU)
-            
-            # load memory from cpu (host); see offload comment above —
+
+            # Reload evicted KV to NPU and remove the spilled copy from CPU.
             # load_size is per-rank, cpu_used is full-cluster.
             if load_size > 0:
+                self.memory.allocate(load_size, Device.NPU)
                 self.memory.free(load_size * self.num_npus, Device.CPU)
             
             # ============ STEP 5: Build batch with lists ============
@@ -532,8 +543,8 @@ class Scheduler:
                         break
 
                 # Load prefix cache from storage if needed
-                if req.is_prefill() and req.storage_cache_hit > req.prefix_cache_hit:
-                    prefix_load_size += (req.storage_cache_hit - req.prefix_cache_hit) * self.memory.get_kv(1)
+                if req.is_prefill() and req.storage_cache_hit > req.npu_cache_hit:
+                    prefix_load_size += (req.storage_cache_hit - req.npu_cache_hit) * self.memory.get_kv(1)
 
                 # Handle evicted requests
                 if req.evict:
@@ -817,9 +828,18 @@ class Scheduler:
     
     # add decode request to decode instance from prefill instnace
     def add_decode(self, req):
+        req.instance_id = self.instance_id
         self.request.append(req)
-        kv_size = self.memory.get_total_kv(req)
-        self.memory.allocate(kv_size, Device.NPU)
+        if self.enable_prefix_caching:
+            self.memory.prefix_match(req)
+            kv_size = self.memory.get_evict_kv(req)
+            evict_size = max(0, kv_size - self.memory.avail_size(Device.NPU))
+            if evict_size > 0:
+                self.memory.evict_prefix_cache(evict_size, Device.NPU)
+            self.memory.cache_unfinished_req(req, Device.NPU)
+        else:
+            kv_size = self.memory.get_total_kv(req)
+            self.memory.allocate(kv_size, Device.NPU)
     
     # get first request's arrival time
     def get_first_arrival_time(self):
@@ -901,7 +921,11 @@ class Scheduler:
         
     # save requests information to an output file
     def save_output(self, output_file, is_append=False):
-        output_file = f'../{output_file}'
+        if not os.path.isabs(output_file):
+            output_file = f'../{output_file}'
+        output_dir = os.path.dirname(output_file)
+        if output_dir:
+            os.makedirs(output_dir, exist_ok=True)
         mode = 'a' if is_append else 'w'
         with open(output_file, mode=mode, newline='') as file:
             # Initialize the CSV writer

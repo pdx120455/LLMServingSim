@@ -3,6 +3,7 @@ import yaml
 import math
 import sys
 import os
+import shutil
 from .utils import get_config
 from .pim_model import PIMModel
 from .logger import get_logger
@@ -22,6 +23,33 @@ _COLLECTIVE_IMPL_KEYS = [
     "reduce-scatter-implementation",
     "all-to-all-implementation",
 ]
+
+
+def _prepare_input_config_paths(astra_sim, inputs_root):
+    if inputs_root is None:
+        inputs_root = os.path.join(astra_sim, "inputs")
+    inputs_root = os.path.abspath(inputs_root)
+
+    network_config_path = os.path.join(inputs_root, "network", "network.yml")
+    system_config_path = os.path.join(inputs_root, "system", "system.json")
+    memory_config_path = os.path.join(inputs_root, "memory", "memory_expansion.json")
+
+    for path in (network_config_path, system_config_path, memory_config_path):
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+
+    default_system_config_path = os.path.join(astra_sim, "inputs", "system", "system.json")
+    if os.path.abspath(system_config_path) != os.path.abspath(default_system_config_path):
+        if not os.path.isfile(default_system_config_path):
+            raise FileNotFoundError(
+                f"ASTRA-Sim system config template '{default_system_config_path}' not found."
+            )
+        shutil.copyfile(default_system_config_path, system_config_path)
+    elif not os.path.isfile(system_config_path):
+        raise FileNotFoundError(
+            f"ASTRA-Sim system config '{system_config_path}' not found."
+        )
+
+    return inputs_root, network_config_path, system_config_path, memory_config_path
 
 
 def _resolve_parallelism(instance, model_config):
@@ -151,14 +179,21 @@ def _resolve_dp_groups(all_instances):
             m["tp_dim"] = tp_dim
             m["ep_dim"] = ep_dim
 
-    # Non-DP instances
+    # Non-DP instances. Independent multi-instance configs still use a
+    # multi-dimensional topology ([tp_size, num_groups]); local collectives
+    # must be scoped to dim 0 so they do not cross instance/PP groups.
+    network_dims = _compute_network_dims(all_instances)
+    local_dim = None
+    if len(network_dims) > 1:
+        local_dim = [True] + [False] * (len(network_dims) - 1)
+
     for inst in all_instances:
         if inst.get("dp_group") is None:
             inst["dp_group_size"] = 1
             inst["local_ep"] = inst["ep_size"]
             inst["ep_total"] = inst["ep_size"]
-            inst["tp_dim"] = None
-            inst["ep_dim"] = None
+            inst["tp_dim"] = local_dim
+            inst["ep_dim"] = local_dim if inst["ep_size"] > 1 else None
 
 
 def _compute_network_dims(instances):
@@ -242,7 +277,7 @@ def _sync_system_collective_dims(system_config_path, instances):
 
 
 # parse cluster configuration from JSON file and build config file for astra-sim
-def build_cluster_config(astra_sim, cluster_config_path, enable_local_offloading=False, enable_attn_offloading=False):
+def build_cluster_config(astra_sim, cluster_config_path, enable_local_offloading=False, enable_attn_offloading=False, inputs_root=None):
     cluster_config_path = f'../{cluster_config_path}' # move out from astra-sim folder
     
     try:
@@ -255,9 +290,9 @@ def build_cluster_config(astra_sim, cluster_config_path, enable_local_offloading
         print(f"Failed to parse JSON from '{cluster_config_path}'.")
         exit(1)
 
-    network_config_path = os.path.join(astra_sim, 'inputs/network/network.yml')
-    system_config_path = os.path.join(astra_sim, 'inputs/system/system.json')
-    memory_config_path = os.path.join(astra_sim, 'inputs/memory/memory_expansion.json')
+    inputs_root, network_config_path, system_config_path, memory_config_path = (
+        _prepare_input_config_paths(astra_sim, inputs_root)
+    )
     memory_config = {}
 
     num_nodes = cluster_config["num_nodes"]
@@ -631,6 +666,10 @@ def build_cluster_config(astra_sim, cluster_config_path, enable_local_offloading
         "pim_models": pim_models,
         "link_bw": link_bw,
         "link_latency": link_latency,
+        "inputs_root": inputs_root,
+        "network_config_path": network_config_path,
+        "system_config_path": system_config_path,
+        "memory_config_path": memory_config_path,
     }
     # print("Current cluster : {}".format(cluster))
                 

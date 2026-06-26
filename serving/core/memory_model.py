@@ -224,7 +224,9 @@ class MemoryModel():
         for i in range(batch_len):
             req = batch_req[i]
             if req.evict or req.is_prefill():
-                # (decode + evict) or (prefill) should load all of KV caches
+                # Prefill and reloaded decode requests may allocate newly
+                # computed blocks. Existing evicted KV is reloaded separately
+                # by Scheduler.load_size.
                 hit = req.npu_cache_hit if self.enable_prefix_caching else 0
                 
                 if scheduled_tokens and req.id in scheduled_tokens:
@@ -464,6 +466,7 @@ class MemoryModel():
             self.npu_prefix_cache.dec_lock_ref(req.npu_last_node)
             # print(f"[UNLOCK] req={req.id} unlock_prefix node_id={node.id} lock_ref_AFTER={node.lock_ref}")
             req.npu_last_node = None
+            req._prefix_locked = False
         elif device == Device.CPU and req.cpu_last_node is not None:
             self.second_tier_prefix_cache.dec_lock_ref(req.cpu_last_node)
             req.cpu_last_node = None
@@ -481,10 +484,12 @@ class MemoryModel():
             
             old_node = req.npu_last_node
             # print(f"[CACHE_UNFINISHED] req={req.id} old_node_id={old_node.id if old_node else None}(lock_ref={old_node.lock_ref if old_node else 'N/A'}) -> new_node_id={new_last_node.id}(lock_ref={new_last_node.lock_ref})")
-            self.npu_prefix_cache.dec_lock_ref(req.npu_last_node)
+            if old_node is not None and req._prefix_locked:
+                self.npu_prefix_cache.dec_lock_ref(old_node)
             self.npu_prefix_cache.inc_lock_ref(new_last_node)
             # print(f"[CACHE_UNFINISHED] req={req.id} AFTER: old_node_id={old_node.id}(lock_ref={old_node.lock_ref}) new_node_id={new_last_node.id}(lock_ref={new_last_node.lock_ref})")
             req.npu_last_node = new_last_node
+            req._prefix_locked = True
             if self.logger.isEnabledFor(logging.DEBUG):
                 # print(f"cache_unfinished_req of req {req.id}")
                 # print(f"===============NPU PREFIX CAHCE of Instance[{self.instance_id}]=================")
@@ -514,7 +519,9 @@ class MemoryModel():
                 # print(f"[CACHE_FINISHED] req={req.id} node_id={node.id if node else None} lock_ref={node.lock_ref if node else 'N/A'} (SKIPPED dec - not locked)")
             else:
                 # print(f"[CACHE_FINISHED] req={req.id} node_id={node.id if node else None} lock_ref_BEFORE={node.lock_ref if node else 'N/A'}")
-                self.npu_prefix_cache.dec_lock_ref(req.npu_last_node)
+                if node is not None:
+                    self.npu_prefix_cache.dec_lock_ref(node)
+                    req.npu_last_node = None
                 req._prefix_locked = False
             # node = req.npu_last_node
             # print(f"[CACHE_FINISHED] req={req.id} node_id={node.id if node else None} lock_ref_BEFORE={node.lock_ref if node else 'N/A'}")
