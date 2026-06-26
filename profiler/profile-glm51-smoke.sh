@@ -31,6 +31,7 @@ HARDWARE="H20"
 VARIANT="fp8"            # REQUIRED: GLM-5.1 torch_dtype is null, so without
                         # this the bundle lands in a default/ folder the
                         # simulator won't resolve for --dtype fp8.
+BLOCK_SIZE=64           # Hopper FlashMLA / FlashMLA_Sparse require 64.
 
 # Only TP=1 for the smoke (one engine boot per round). Real sweep does 1,2,4,8.
 TP_DEGREES="1"
@@ -62,7 +63,14 @@ cd "$REPO_ROOT"
 # Shared flags for both rounds.
 common_flags() {
     local -n _out=$1
-    _out=(--hardware "$HARDWARE" --variant "$VARIANT" --tp "$TP_DEGREES")
+    # --dtype bfloat16 = compute/activation dtype. MUST be set explicitly:
+    # GLM-5.1's config uses transformers-5.x "dtype" (not "torch_dtype"),
+    # so vLLM's default dtype=auto falls back to float16 — which
+    # FlashMLA/FlashMLA_Sparse reject on Hopper ("No valid attention
+    # backend"). FP8 weights come from the config's quantization_config;
+    # the folder name comes from --variant fp8.
+    _out=(--hardware "$HARDWARE" --variant "$VARIANT" --dtype bfloat16 --tp "$TP_DEGREES")
+    _out+=(--block-size "$BLOCK_SIZE")
     _out+=(--max-num-batched-tokens "$MAX_NUM_BATCHED_TOKENS")
     _out+=(--max-num-seqs "$MAX_NUM_SEQS")
     _out+=(--attention-max-kv "$ATTENTION_MAX_KV")
