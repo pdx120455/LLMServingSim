@@ -103,6 +103,8 @@ Step 6(simulator)在 **simulator 容器**(`scripts/docker-sim.sh`)或原生编�
 
 ## Step 1 — profile dense / per_sequence / attention(Phase 1.3)
 
+> **先验通路(可选,强烈建议第一次跑)**:`./profiler/profile-glm51-smoke.sh` 用极小 sweep grid(64/8/512、iter=1、SKIP_SKEW)自动跑完 dense+MoE 两轮、几分钟内出 CSV,只为确认 profiler 在 H20 上不卡死、引擎能 boot/teardown、hook 能触发。数据不准,验完正式全量前用 `FORCE=1 ./profiler/profile.sh` 清掉这些粗点再重测。
+
 编辑 `profiler/profile.sh`,改这几个变量:
 ```bash
 MODEL="zai-org/GLM-5.1"
