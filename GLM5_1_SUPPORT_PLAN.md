@@ -223,6 +223,7 @@ model_type: "glm_moe_dsa"                    → 需要 profiler/models/glm_moe_
 
 | 日期 | 决策 | 理由 |
 |---|---|---|
+| 2026-06-26 | **同步上游 `origin/main` 23 提交（merge `2ece922`，非 rebase）** | 集成策略选 merge：本分支长命、反复同步、按 Phase 4.2 拆干净小分支提上游（不整体提交），符合"长命分支 merge、提交前再切干净 topic 分支"主流实践（merge 只解一次冲突、不 force-push）。冲突=2 文件 7 hunk 全机械性。**核心适配**：上游 `bdfa6f7` per-instance 重构把 dtype/fp 流动改成 `inst_cfg[...]`，其 `"fp"=dtype_to_bits[dtype]`（fp8→8）**正是 `43b12c4` 修掉的单 fp bug**；解法=在 `_build_instance_runtime_configs` dict 加 `"weight_fp"` + 改 `"fp"=max(...,16)`，调用点按 use-site 分流（weight→weight_fp、comm/KV→fp），删除被上游 `_resolve_instance_dtype` 取代的全局 dtype-peek block。**验证**：bf16 smoke bit-exact（merged vs pre-merge `diff` 无差异）；`--dtype fp8` tp2 trace o_proj/down_proj weight 精确减半且 ALLREDUCE comm 不变（未合回 bug）；glm yaml 仍 load。**白拿上游收益**：prefix-cache/PD KV 记账修复、run 隔离输入路径、PIM 泛化；`c4edd0a` 独立修了我们的 power_model `:` 后缀 bug → 该改动可在 Phase 4.2 撤出不再单独提 PR。未 push |
 | 2026-05-28 | 第一版不支持 MTP head | 复杂度高且对 baseline 性能数据非必需，可后续增量 |
 | 2026-05-28 | profile dense layer 和 MoE layer 分两次跑（用 hf_overrides 控制 first_k_dense_replace） | 比改 profiler 假设"单层代表全模型"工作量小，且无副作用 |
 | 2026-05-28 | 暂不在 5060Ti 上验证任何 GLM-5.1 相关改动 | 装不下 |
