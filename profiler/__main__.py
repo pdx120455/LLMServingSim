@@ -111,6 +111,13 @@ def _add_common_flags(p: argparse.ArgumentParser) -> None:
                    dest="max_num_seqs",
                    help="Max concurrent sequences. Matches vLLM's own "
                         "``--max-num-seqs``. Default: 256.")
+    p.add_argument("--block-size", type=int, default=None,
+                   dest="block_size",
+                   help="KV cache paging block size. Default: 16. Some "
+                        "MLA attention backends (FlashMLA / FlashMLA_Sparse "
+                        "on Hopper) require block_size=64; set this for "
+                        "GLM-5.1 / DeepSeek-V3.2. Only affects the synthetic "
+                        "block table, not kernel time.")
     p.add_argument("--hf-overrides", default=None, dest="hf_overrides",
                    help="JSON string of HF config overrides merged on top "
                         "of profiler defaults (num_hidden_layers=1) and "
@@ -355,6 +362,7 @@ def _build_profile_args(
         kv_cache_dtype=ns.kv_cache_dtype,
         max_num_batched_tokens=ns.max_num_batched_tokens,
         max_num_seqs=ns.max_num_seqs,
+        block_size=getattr(ns, "block_size", None),
         attention_max_kv=ns.attention_max_kv,
         attention_chunk_factor=ns.attention_chunk_factor,
         attention_kv_factor=ns.attention_kv_factor,

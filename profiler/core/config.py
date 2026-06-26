@@ -366,6 +366,10 @@ class ProfileArgs:
     kv_cache_dtype: str | None = None
     max_num_batched_tokens: int | None = None
     max_num_seqs: int | None = None
+    block_size: int | None = None
+    """KV cache paging block size override. Default (None) keeps the
+    HOST_ENGINE_DEFAULTS value of 16. Set to 64 for MLA backends that
+    require it (FlashMLA / FlashMLA_Sparse on Hopper, e.g. GLM-5.1)."""
     hf_overrides: dict[str, Any] | None = None
     """CLI-specified hf_overrides applied on top of the model config
     at vLLM load time."""

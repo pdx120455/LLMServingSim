@@ -100,6 +100,8 @@ def _profile_engine_overrides(args: ProfileArgs) -> dict[str, Any]:
         out["max_num_batched_tokens"] = args.max_num_batched_tokens
     if args.max_num_seqs is not None:
         out["max_num_seqs"] = args.max_num_seqs
+    if args.block_size is not None:
+        out["block_size"] = args.block_size
     if args.hf_overrides is not None:
         out["hf_overrides"] = args.hf_overrides
     return out
