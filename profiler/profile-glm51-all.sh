@@ -29,6 +29,11 @@ VARIANT="fp8"                 # REQUIRED (GLM torch_dtype is null)
 TP_DEGREES="1,2,4,8"          # full sweep; Step 2 (moe) always uses TP=1
 BLOCK_SIZE=64                 # Hopper FlashMLA / FlashMLA_Sparse require 64
 
+# Which rounds to run, comma-separated: 1=dense, 2=moe, 3=skew.
+# Default "1,2,3" runs all three. Override to test one in isolation, e.g.
+# STEPS=3 ./profiler/profile-glm51-all.sh   (skew only; resume keeps 1&2).
+STEPS="${STEPS:-1,2,3}"
+
 # =============================================================================
 # SWEEP GRID — real scale by default. SMOKE=1 swaps in the tiny grid.
 # =============================================================================
@@ -99,22 +104,30 @@ run_step() {
 flags=()
 common_flags flags
 
+want() { [[ ",$STEPS," == *",$1,"* ]]; }
+
 # --- Step 1: dense / per_sequence / attention (skip moe + skew, full TP) ---
-run_step "Step 1 (dense)" "glm_profile_dense_${STAMP}.log" \
-    python3 -m profiler profile "$MODEL" "${flags[@]}" \
-        --tp "$TP_DEGREES" --skip-moe --skip-skew
+if want 1; then
+    run_step "Step 1 (dense)" "glm_profile_dense_${STAMP}.log" \
+        python3 -m profiler profile "$MODEL" "${flags[@]}" \
+            --tp "$TP_DEGREES" --skip-moe --skip-skew
+fi
 
 # --- Step 2: moe (force layer 0 to MoE, TP=1, resume keeps Step 1 shots) ---
-run_step "Step 2 (moe)" "glm_profile_moe_${STAMP}.log" \
-    python3 -m profiler profile "$MODEL" "${flags[@]}" \
-        --tp "1" --skip-skew --hf-overrides '{"first_k_dense_replace":0}'
+if want 2; then
+    run_step "Step 2 (moe)" "glm_profile_moe_${STAMP}.log" \
+        python3 -m profiler profile "$MODEL" "${flags[@]}" \
+            --tp "1" --skip-skew --hf-overrides '{"first_k_dense_replace":0}'
+fi
 
 # --- Step 3: skew only (full TP, no hf-overrides) ---
-run_step "Step 3 (skew)" "glm_profile_skew_${STAMP}.log" \
-    python3 -m profiler profile "$MODEL" "${flags[@]}" \
-        --tp "$TP_DEGREES" --only-skew \
-        --skew-n-factor "$SKEW_FACTOR" --skew-pc-factor "$SKEW_FACTOR" \
-        --skew-kp-factor "$SKEW_FACTOR" --skew-kvs-factor "$SKEW_FACTOR"
+if want 3; then
+    run_step "Step 3 (skew)" "glm_profile_skew_${STAMP}.log" \
+        python3 -m profiler profile "$MODEL" "${flags[@]}" \
+            --tp "$TP_DEGREES" --only-skew \
+            --skew-n-factor "$SKEW_FACTOR" --skew-pc-factor "$SKEW_FACTOR" \
+            --skew-kp-factor "$SKEW_FACTOR" --skew-kvs-factor "$SKEW_FACTOR"
+fi
 
 echo
 echo "================================================================"
