@@ -99,8 +99,15 @@ catalog:
       vllm: RowParallelLinear
       within: DeepseekV2MLP
     final_layernorm:
+      # No `within`: the model-level final RMSNorm is the only RMSNorm whose
+      # ancestor chain has neither a decoder-layer nor an MLA-wrapper class, so
+      # the within:null fallback in _match_slice() catches exactly it,
+      # independent of the model class name (which differs across vLLM
+      # versions / GlmMoeDsa subclassing). A concrete `within` like
+      # DeepseekV2Model silently failed to match on vLLM 0.21. The deepest-match
+      # rule keeps the other RMSNorms (layernorm / mla_lora_layernorm) correctly
+      # attributed since their real `within` outranks this fallback.
       vllm: RMSNorm
-      within: DeepseekV2Model
       tp_stable: true
   per_sequence:
     lm_head:

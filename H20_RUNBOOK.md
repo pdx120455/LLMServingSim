@@ -21,7 +21,7 @@
 | Step | 内容 | 卡数 | 环境 | 预计耗时 |
 |---|---|---|---|---|
 | 0 | 环境 + 镜像 | 0 | host | ~30min(拉镜像) |
-| 1 | profile dense/per_seq/attention × TP 1/2/4/8 | 1 | vLLM 容器 | 每 TP 0.5-1.5h(首次 JIT 另加 5-30min) |
+| 1 | profile dense/per_seq/attention × TP 1/8 | 1 | vLLM 容器 | 每 TP 0.5-1.5h(首次 JIT 另加 5-30min) |
 | 2 | hook 自检 + profile moe(tp=1 一轮) | 1 | vLLM 容器 | 自检 ~1min;moe 轮 ~0.5h |
 | 3 | profile skew(可选) | 1 | vLLM 容器 | 每 TP 1-2h |
 | 4 | 填 cluster config 硬件参数 | 0 | 编辑器 | ~10min |
@@ -109,7 +109,7 @@ Step 6(simulator)在 **simulator 容器**(`scripts/docker-sim.sh`)或原生编�
 ```bash
 MODEL="zai-org/GLM-5.1"
 HARDWARE="H20"                 # 必须和 cluster config 的 hardware 字段一致
-TP_DEGREES="1,2,4,8"
+TP_DEGREES="1,8"               # ★ 只 profile 1 和 8:见下方"为什么不跑 tp2/tp4"
 VARIANT="fp8"                  # ★ 关键:见下方"变体命名"
 MAX_NUM_SEQS=256              # 决定 attention/skew 的 n 上界(见 CLAUDE.md 可行性边界)
 MAX_NUM_BATCHED_TOKENS=2048
@@ -127,6 +127,14 @@ SKIP_SKEW=1
 模型里没有 FusedMoE → `single_moe_layer` raise RuntimeError,**整个 sweep 中途崩、
 tp=2/4/8 和 meta.yaml 全丢**。moe 在 Step 2 单独一轮补。
 
+**为什么 TP_DEGREES 只有 1,8(不跑 tp2/tp4)**:GLM-5.1 FP8 权重 ≈ 670GB,H20 单卡
+96GB → tp4(4×96=384GB)、tp2(192GB)都装不下权重,唯一可行部署是 **tp8(整 8 卡
+节点,768GB)**。模拟器按 cluster config 的 TP 度数精确查 `tp<N>/`,集群只会是 tp8,
+所以 `tp2/`、`tp4/` 永不被查、profile 它们纯浪费(每个 TP 又是一轮引擎启动 + 全 sweep)。
+**tp1** 保留作单卡调试/交叉校验基线。注意 profiler 的 "tp8" 是**单卡用 hf_overrides
+切 shape 模拟**的(不真加载 670GB),所以这里和 8 卡显存无关,纯粹省墙钟时间。
+moe 轮(Step 2)本就只在 tp1 测,不受影响。
+
 **变体命名(VARIANT="fp8")为什么**:GLM-5.1 是 FP8 *checkpoint*,计算精度是 bf16。
 profiler 默认按 weight dtype 给 variant 文件夹命名,而 GLM-5.1 config 的
 `torch_dtype` 是 **null** → 不设 VARIANT 会落到 `default/` 文件夹(名不副实且
@@ -139,7 +147,7 @@ checkpoint 的 `quantization_config` 自动处理。
 `--verbose`(profile.sh 里 `VERBOSITY="--verbose"`)能看到进度,别误判卡死。
 JIT 产物缓存在 `~/.cache`,容器重启后会重编;长时间作业尽量别销毁容器。
 
-产出:`profiler/perf/H20/zai-org/GLM-5.1/fp8/tp{1,2,4,8}/{dense,per_sequence,attention}.csv`
+产出:`profiler/perf/H20/zai-org/GLM-5.1/fp8/tp{1,8}/{dense,per_sequence,attention}.csv`
 
 ---
 
@@ -162,7 +170,7 @@ python -m profiler.core.hooks.verify_moe_hook 2>&1 | tee logs/glm_moe_hook_verif
 然后改 `profile.sh` 再跑一轮(其余变量同 Step 1):
 ```bash
 SKIP_MOE=                      # 去掉(或注释),本轮就是要 moe
-TP_DEGREES="1"                 # moe 永远只在 tp=1 测(EP 由 simulator 建模),省 3 次引擎启动
+TP_DEGREES="1"                 # moe 永远只在 tp=1 测(EP 由 simulator 建模),省去其它 TP 的引擎启动
 HF_OVERRIDES='{"first_k_dense_replace":0}'   # 强制第 0 层变 MoE,否则 moe.csv 为空
 SKIP_SKEW=1
 ```
@@ -188,7 +196,7 @@ GLM-5.1 `n_shared_experts=1`,shared expert 在 `FusedMoE.forward` 内部算,moe.
 ## Step 3 — profile skew(可选,Phase 1.3 第二轮,每 TP 1-2h)
 
 attention 的 skew alpha 拟合。第一轮验证可先跳过(simulator 用 pooled 常数 alpha 兜底)。
-要做就改 `profile.sh`(TP_DEGREES 还原 `"1,2,4,8"`,HF_OVERRIDES 清掉):
+要做就改 `profile.sh`(TP_DEGREES 还原 `"1,8"`,HF_OVERRIDES 清掉):
 ```bash
 # 去掉 SKIP_SKEW,加 ONLY_SKEW=1 只刷 skew(其他 CSV 不动)
 ONLY_SKEW=1 ./profiler/profile.sh 2>&1 | tee logs/glm_profile_skew.log
@@ -216,8 +224,8 @@ wc -l $P/tp1/attention.csv $P/tp1/moe.csv
 head $P/tp1/moe.csv          # time_us 应随 tokens / activated_experts 单调增长
 grep -E "max_num_seqs|max_num_batched_tokens" $P/meta.yaml   # 应为 256 / 2048
 
-# tp2/4/8 同样有 dense/per_sequence/attention(tp_stable 层由 tp1 复制):
-ls $P/tp2 $P/tp4 $P/tp8
+# tp8 同样有 dense/per_sequence/attention(tp_stable 层由 tp1 复制):
+ls $P/tp1 $P/tp8
 ```
 最终兜底验收在 Step 6:simulator 加载该 profile 后,日志里**不应出现**
 "missing from the profile" 一次性警告(出现 = 某 sequence 层没采到数据)。
@@ -381,7 +389,7 @@ python -m bench validate \
 #                    守卫若报错 → VLLM_USE_FLASHINFER_MOE_FP8=0 带满本轮)
 #                    再 profile.sh 去 SKIP_MOE、TP_DEGREES="1"、
 #                    HF_OVERRIDES='{"first_k_dense_replace":0}' → ./profiler/profile.sh
-# Step3 skew(可选): ONLY_SKEW=1 ./profiler/profile.sh(TP 还原 1,2,4,8、清 HF_OVERRIDES)
+# Step3 skew(可选): ONLY_SKEW=1 ./profiler/profile.sh(TP 还原 1,8、清 HF_OVERRIDES)
 # 验收: dense.csv 13 层名 / per_sequence 2 / attention+moe 非空(详见 Step 3 末尾)
 # Step4: 填 configs/cluster/h20_8_glm5_1_fp8.json(HBM 4000, NVLink 450 单向, latency ~500ns)
 python -m bench run --model /path/to/GLM-5.1 --dataset <ds> --output-dir bench/results/glm51_h20 \
@@ -407,5 +415,6 @@ python -m bench validate --bench-dir bench/results/glm51_h20 \
 | Step 6 `FileNotFoundError: ..//...` | `--output` 用了绝对路径 | 只用仓库相对路径(全局约定 2) |
 | Step 7 找不到 sim log | 日志写在 /tmp(跨容器不可见) | 日志全部落 `logs/`(全局约定 1) |
 | Step 6 日志有 `missing from the profile` | profile CSV 缺层 | 回 Step 1-3 验收逐项核对;通常是 Step 2 没跑或 variant 不匹配 |
+| dense.csv 缺 `final_layernorm`(只这一层) | yaml `within` 字符串与 0.21 实际类名不符,匹配被跳过(已修:within:null 兜底,commit 见决策日志 2026-06-29) | 拉到最新 glm_moe_dsa.yaml(final_layernorm 无 within)重跑 dense 轮;**应急**:因 final_layernorm 是 tp_stable,只手补 `tp1/dense.csv` 即可让 simulator 不报缺层(所有 TP 查表都重定向 tp1),值可照抄同表 `layernorm` 行 |
 | Step 6 variant `FileNotFoundError` | VARIANT 与 `--dtype` 解析不一致 | profiler VARIANT="fp8" + simulator `--dtype fp8` 必须配对 |
 | bench OOM / KV 不足 | 8 卡装不下 + 256 并发 | 降 `--max-num-seqs`(两边同步降!)或 `--max-model-len` |
