@@ -33,7 +33,7 @@ VARIANT="fp8"            # REQUIRED: GLM-5.1 torch_dtype is null, so without
                         # simulator won't resolve for --dtype fp8.
 BLOCK_SIZE=64           # Hopper FlashMLA / FlashMLA_Sparse require 64.
 
-# Only TP=1 for the smoke (one engine boot per round). Real sweep does 1,2,4,8.
+# Only TP=1 for the smoke (one engine boot per round). Real sweep does 1,8.
 TP_DEGREES="1"
 
 # Which rounds to run: "dense", "moe", or "both" (default).

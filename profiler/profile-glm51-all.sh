@@ -26,7 +26,11 @@ set -euo pipefail
 MODEL="zai-org/GLM-5.1"
 HARDWARE="H20"
 VARIANT="fp8"                 # REQUIRED (GLM torch_dtype is null)
-TP_DEGREES="1,2,4,8"          # full sweep; Step 2 (moe) always uses TP=1
+# GLM-5.1 FP8 weights (~670GB) only fit on a full 8-card node, so tp2/tp4
+# deployments are physically impossible -> never looked up by the simulator,
+# no point profiling them. tp1 is kept as a single-GPU debug/cross-check
+# baseline. Step 2 (moe) always uses TP=1 regardless.
+TP_DEGREES="1,8"
 BLOCK_SIZE=64                 # Hopper FlashMLA / FlashMLA_Sparse require 64
 
 # Which rounds to run, comma-separated: 1=dense, 2=moe, 3=skew.
